@@ -8,6 +8,7 @@ import numpy as np
 from openenv.core.env_server.interfaces import Environment
 from openenv.core.env_server.types import EnvironmentMetadata
 
+from ..coordinator import CoordinatorAgent, LLMCoordinator
 from ..models import (
     ACTION_LABELS,
     Coord,
@@ -26,7 +27,9 @@ from ..models import (
     compute_level5_reward,
     compute_reward,
     get_fov_cells,
+    manhattan_distance,
     normalize_actions,
+    normalize_targets,
     spawn_event,
 )
 
@@ -46,6 +49,7 @@ class DisasterSurveillanceEnvironment(
     COVERAGE_REWARD_PER_NEW_CELL = 0.5
     EVENT_MEMORY_LIMIT = 5
     LATENCY_BONUS_THRESHOLD = 3.0
+    COORDINATOR_RECENT_MEMORY = 25
 
     def __init__(
         self,
@@ -57,28 +61,40 @@ class DisasterSurveillanceEnvironment(
         coverage_reward_per_new_cell: float = COVERAGE_REWARD_PER_NEW_CELL,
         level: int = 4,
         seed: Optional[int] = None,
+        coordinator: Optional[CoordinatorAgent] = None,
     ) -> None:
         super().__init__()
-        if level not in {3, 4, 5}:
-            raise ValueError(f"level must be 3, 4, or 5; got {level}.")
+        if level not in {3, 4, 5, 6}:
+            raise ValueError(f"level must be 3, 4, 5, or 6; got {level}.")
 
         self.level = level
         self.grid_size = grid_size
         self.episode_length = episode_length
         self.agent_ids = [f"drone_{index + 1}" for index in range(n_drones)]
-        self.action_space: Dict[str, Any] = {
-            "type": "multi_agent_discrete",
-            "agents": self.agent_ids,
-            "n": 5,
-            "actions": ACTION_LABELS,
-        }
+        self.coordinator = coordinator or (LLMCoordinator() if level == 6 else None)
+        self.action_space: Dict[str, Any] = (
+            {
+                "type": "multi_agent_target_assignment",
+                "agents": self.agent_ids,
+                "target_shape": [2],
+                "description": "Coordinator-assigned target coordinates for each drone.",
+            }
+            if self.level == 6
+            else {
+                "type": "multi_agent_discrete",
+                "agents": self.agent_ids,
+                "n": 5,
+                "actions": ACTION_LABELS,
+            }
+        )
         self.observation_space: Dict[str, Any] = {
             "type": "per_agent_partial_observation",
-            "coordination": "decentralized",
+            "coordination": "centralized_coordinator" if self.level == 6 else "decentralized",
             "communication": "none",
             "reward_mode": self.reward_mode,
             "agents": self.agent_ids,
             "position": {"shape": [2], "dtype": "int"},
+            "assigned_target": {"shape": [2], "dtype": "int"},
             "visible_cells": {"shape": ["variable", 2], "dtype": "int"},
             "visible_events": {
                 "shape": ["variable"],
@@ -102,6 +118,16 @@ class DisasterSurveillanceEnvironment(
             "exploration": {
                 "fields": ["steps_taken", "visited_cell_count", "revisit_count", "coverage_ratio", "last_action"],
             },
+            "coordinator": {
+                "fields": [
+                    "timestep",
+                    "drone_positions",
+                    "visible_active_events",
+                    "known_detected_events",
+                    "team_frontier_cells",
+                    "recently_observed_cells",
+                ],
+            },
         }
         self.fov_radius = fov_radius
         self.p_spawn = p_spawn
@@ -116,6 +142,9 @@ class DisasterSurveillanceEnvironment(
         self.metrics: Dict[str, Any] = {}
         self._last_reward = 0.0
         self._episode_bonus_applied = False
+        self._recently_observed_cells: list[Coord] = []
+        self.last_assigned_targets: Dict[str, Coord] = {}
+        self.last_coordinator_observation: Dict[str, Any] = {}
         self.reset(seed=seed)
 
     def get_metadata(self) -> EnvironmentMetadata:
@@ -123,11 +152,12 @@ class DisasterSurveillanceEnvironment(
             3: "Level 3 decentralized RL environment with shared global reward and no communication.",
             4: "Level 4 decentralized coordination environment with implicit FOV overlap and coverage reward shaping.",
             5: "Level 5 long-horizon disaster surveillance with urgency, prioritization, delayed rewards, and hotspot-biased event spawning.",
+            6: "Level 6 coordinator-driven disaster surveillance with centralized target assignment and drone execution toward goals.",
         }
         return EnvironmentMetadata(
             name="disaster-surveillance-grid",
             description=descriptions[self.level],
-            version="0.4.0",
+            version="0.5.0",
         )
 
     @property
@@ -136,7 +166,9 @@ class DisasterSurveillanceEnvironment(
             return "shared_global_baseline"
         if self.level == 4:
             return "shared_global_overlap_and_coverage_shaping"
-        return "shared_global_long_horizon_priority_shaping"
+        if self.level == 5:
+            return "shared_global_long_horizon_priority_shaping"
+        return "shared_global_coordinator_priority_shaping"
 
     @property
     def state(self) -> DisasterState:
@@ -165,6 +197,7 @@ class DisasterSurveillanceEnvironment(
                     "revisit_count": drone.revisit_count,
                     "steps_taken": drone.steps_taken,
                     "last_action": ACTION_LABELS[drone.last_action],
+                    "current_target": drone.current_target,
                     "detected_event_history_size": len(drone.detected_event_history),
                 }
                 for drone_id, drone in self.drones.items()
@@ -192,6 +225,9 @@ class DisasterSurveillanceEnvironment(
         self.events = []
         self.visited_cells = set()
         self._episode_bonus_applied = False
+        self._recently_observed_cells = []
+        self.last_assigned_targets = {}
+        self.last_coordinator_observation = {}
         self.drones = {
             drone_id: Drone(
                 id=drone_id,
@@ -209,7 +245,7 @@ class DisasterSurveillanceEnvironment(
         latency_lists = {severity: [] for severity in SEVERITY_CONFIG}
         self.metrics = {
             "level": self.level,
-            "coordination_mode": "decentralized_no_communication",
+            "coordination_mode": "centralized_coordinator" if self.level == 6 else "decentralized_no_communication",
             "reward_mode": self.reward_mode,
             "hotspots": list(HOTSPOTS),
             "total_events_spawned": 0,
@@ -229,6 +265,7 @@ class DisasterSurveillanceEnvironment(
             "events_spawned_by_severity": dict(zero_by_severity),
             "events_detected_by_severity": dict(zero_by_severity),
             "missed_by_severity": dict(zero_by_severity),
+            "pending_by_severity": dict(zero_by_severity),
             "detected_on_time_by_severity": dict(zero_by_severity),
             "avg_latency_by_severity": {severity: None for severity in SEVERITY_CONFIG},
             "on_time_detection_rate": 0.0,
@@ -242,6 +279,19 @@ class DisasterSurveillanceEnvironment(
                 "coverage_reward": 0.0,
                 "episode_bonus": 0.0,
             },
+            "last_assigned_targets": {},
+            "target_assignment_count": 0,
+            "target_progress_sum": 0.0,
+            "movement_distance_sum": 0.0,
+            "path_efficiency": 0.0,
+            "coordination_quality": 0.0,
+            "coordinator_backend": type(self.coordinator).__name__ if self.coordinator is not None else None,
+            "coordinator_model_name": getattr(self.coordinator, "model_name", None),
+            "coordinator_decision_source": None,
+            "coordinator_fallback_count": 0,
+            "coordinator_fallback_reason": None,
+            "last_llm_latency_ms": None,
+            "last_llm_raw_response": None,
             "_latencies_by_severity": latency_lists,
         }
         self._mark_initial_cells_visited()
@@ -252,7 +302,7 @@ class DisasterSurveillanceEnvironment(
 
     def step(
         self,
-        action: DroneActions | Mapping[str, int] | Sequence[int],
+        action: DroneActions | Mapping[str, Any] | Sequence[Any] | None,
         timeout_s: Optional[float] = None,
         **kwargs: Any,
     ) -> DisasterObservation:
@@ -261,13 +311,21 @@ class DisasterSurveillanceEnvironment(
         if self.timestep >= self.episode_length:
             return self._build_current_observation(reward=0.0, done=True)
 
-        actions = normalize_actions(action, self.agent_ids)
+        processed_timestep = self.timestep
         self._spawn_step_event()
 
-        for drone_id, drone in self.drones.items():
-            drone.move(actions[drone_id], self.grid_size)
+        if self.level == 6:
+            coordinator_observation = self.build_coordinator_observation()
+            assigned_targets = self._resolve_coordinator_targets(action, coordinator_observation)
+            self._apply_coordinator_targets(assigned_targets)
+        else:
+            coordinator_observation = None
+            actions = normalize_actions(action, self.agent_ids)
+            for drone_id, drone in self.drones.items():
+                drone.move(actions[drone_id], self.grid_size)
 
         fovs = self._compute_fovs()
+        self._remember_observed_cells(fovs)
         detected_events = self._detect_events(fovs)
         missed_events = self._remove_detected_and_expired()
         self._update_drone_detection_memory(detected_events, fovs)
@@ -292,12 +350,19 @@ class DisasterSurveillanceEnvironment(
         self.metrics["episode_rescue_score"] = self.metrics["total_reward"]
         self._last_reward = reward
 
-        observation = self._build_current_observation(reward=reward, done=done)
+        observation = self._build_current_observation(
+            reward=reward,
+            done=done,
+            coordinator_observation=coordinator_observation,
+        )
         observation.metadata.update(reward_info)
+        observation.metadata["processed_timestep"] = processed_timestep
+        observation.metadata["next_timestep"] = self.timestep
         observation.metadata["last_step_detected"] = len(detected_events)
         observation.metadata["last_step_missed"] = len(missed_events)
-        observation.metadata["coordination_mode"] = "decentralized_no_communication"
+        observation.metadata["coordination_mode"] = self.metrics["coordination_mode"]
         observation.metadata["reward_mode"] = self.reward_mode
+        observation.metadata["assigned_targets"] = dict(self.last_assigned_targets)
         return observation
 
     def render_ascii(self) -> str:
@@ -307,12 +372,64 @@ class DisasterSurveillanceEnvironment(
         for event in self.events:
             if event.is_active(self.timestep) and not event.detected:
                 x, y = event.location
-                label = event.severity[0]
-                grid[y][x] = label
+                grid[y][x] = event.severity[0]
+        for drone_id, target in self.last_assigned_targets.items():
+            x, y = target
+            if grid[y][x] == ".":
+                grid[y][x] = "T"
         for index, drone in enumerate(self.drones.values(), start=1):
             x, y = drone.position
             grid[y][x] = str(index)
         return "\n".join(" ".join(row) for row in grid)
+
+    def build_coordinator_observation(self) -> Dict[str, Any]:
+        fovs = self._compute_fovs()
+        visible_cells = set().union(*fovs.values()) if fovs else set()
+        team_frontier_cells = sorted(cell for cell in visible_cells if cell not in self.visited_cells)
+        visible_active_events = [
+            {
+                "id": event.id,
+                "location": event.location,
+                "severity": event.severity,
+                "time_remaining": event.end_time - self.timestep,
+                "deadline_remaining": event.deadline_step - self.timestep,
+            }
+            for event in self.events
+            if event.is_active(self.timestep) and event.location in visible_cells and not event.detected
+        ]
+        known_detected_events = sorted(
+            {
+                (
+                    entry["id"],
+                    entry["severity"],
+                    tuple(entry["location"]),
+                    int(entry["detected_at"]),
+                )
+                for drone in self.drones.values()
+                for entry in drone.detected_event_history
+            }
+        )
+
+        observation = {
+            "timestep": self.timestep,
+            "grid_size": self.grid_size,
+            "drone_positions": {drone_id: drone.position for drone_id, drone in self.drones.items()},
+            "visible_active_events": visible_active_events,
+            "known_detected_events": [
+                {
+                    "id": event_id,
+                    "severity": severity,
+                    "location": location,
+                    "detected_at": detected_at,
+                }
+                for event_id, severity, location, detected_at in known_detected_events
+            ],
+            "team_frontier_cells": team_frontier_cells,
+            "recently_observed_cells": list(self._recently_observed_cells[-self.COORDINATOR_RECENT_MEMORY :]),
+            "recent_team_coverage_ratio": self.metrics.get("grid_coverage", 0.0),
+        }
+        self.last_coordinator_observation = observation
+        return observation
 
     def _compute_fovs(self) -> Dict[str, set[Coord]]:
         return {
@@ -324,6 +441,14 @@ class DisasterSurveillanceEnvironment(
         initial_fovs = self._compute_fovs()
         initial_visible_cells = set().union(*initial_fovs.values()) if initial_fovs else set()
         self.visited_cells.update(initial_visible_cells)
+        self._remember_observed_cells(initial_fovs)
+
+    def _remember_observed_cells(self, fovs: Mapping[str, set[Coord]]) -> None:
+        visible_cells = sorted(set().union(*fovs.values()) if fovs else set())
+        for cell in visible_cells:
+            self._recently_observed_cells.append(cell)
+        if len(self._recently_observed_cells) > self.COORDINATOR_RECENT_MEMORY:
+            self._recently_observed_cells = self._recently_observed_cells[-self.COORDINATOR_RECENT_MEMORY :]
 
     def _spawn_step_event(self) -> None:
         new_event = spawn_event(
@@ -341,6 +466,82 @@ class DisasterSurveillanceEnvironment(
         self.metrics["total_events_spawned"] += 1
         self.metrics["events_spawned_by_severity"][new_event.severity] += 1
         self._sync_priority_metrics()
+
+    def _resolve_coordinator_targets(
+        self,
+        action: DroneActions | Mapping[str, Any] | Sequence[Any] | None,
+        coordinator_observation: Mapping[str, Any],
+    ) -> Dict[str, Coord]:
+        if action is None:
+            decision = self.coordinator.decide(coordinator_observation) if hasattr(self.coordinator, "decide") else None
+            targets = decision.targets if decision is not None else self.coordinator.act(coordinator_observation)
+            decision_metadata = decision.metadata if decision is not None else getattr(self.coordinator, "last_metadata", {})
+        elif isinstance(action, DroneActions):
+            if action.targets is not None:
+                targets = normalize_targets(action, self.agent_ids, self.grid_size)
+                decision_metadata = {
+                    "decision_source": "external_targets",
+                    "model_name": getattr(self.coordinator, "model_name", None),
+                }
+            elif action.actions is not None:
+                raise ValueError("Level 6 does not accept direct per-drone movement actions.")
+            else:
+                decision = self.coordinator.decide(coordinator_observation) if hasattr(self.coordinator, "decide") else None
+                targets = decision.targets if decision is not None else self.coordinator.act(coordinator_observation)
+                decision_metadata = decision.metadata if decision is not None else getattr(self.coordinator, "last_metadata", {})
+        elif isinstance(action, Mapping):
+            sample_value = next(iter(action.values()), None)
+            if sample_value is None:
+                decision = self.coordinator.decide(coordinator_observation) if hasattr(self.coordinator, "decide") else None
+                targets = decision.targets if decision is not None else self.coordinator.act(coordinator_observation)
+                decision_metadata = decision.metadata if decision is not None else getattr(self.coordinator, "last_metadata", {})
+            elif isinstance(sample_value, (tuple, list)):
+                targets = normalize_targets(action, self.agent_ids, self.grid_size)
+                decision_metadata = {
+                    "decision_source": "external_targets",
+                    "model_name": getattr(self.coordinator, "model_name", None),
+                }
+            else:
+                raise ValueError("Level 6 expects coordinator targets, not direct movement actions.")
+        else:
+            targets = normalize_targets(action, self.agent_ids, self.grid_size)
+            decision_metadata = {
+                "decision_source": "external_targets",
+                "model_name": getattr(self.coordinator, "model_name", None),
+            }
+
+        if not isinstance(targets, dict):
+            targets = dict(targets)
+
+        normalized_targets = normalize_targets(targets, self.agent_ids, self.grid_size)
+        self.last_assigned_targets = normalized_targets
+        self.metrics["last_assigned_targets"] = dict(normalized_targets)
+        self.metrics["target_assignment_count"] += 1
+        unique_targets = len(set(normalized_targets.values()))
+        self.metrics["coordination_quality"] = unique_targets / float(len(self.agent_ids))
+        self.metrics["coordinator_decision_source"] = decision_metadata.get("decision_source")
+        self.metrics["coordinator_model_name"] = decision_metadata.get("model_name")
+        self.metrics["coordinator_fallback_reason"] = decision_metadata.get("fallback_reason")
+        self.metrics["last_llm_latency_ms"] = decision_metadata.get("llm_latency_ms")
+        self.metrics["last_llm_raw_response"] = decision_metadata.get("llm_raw_response")
+        if decision_metadata.get("decision_source") == "heuristic_fallback":
+            self.metrics["coordinator_fallback_count"] += 1
+        return normalized_targets
+
+    def _apply_coordinator_targets(self, assigned_targets: Mapping[str, Coord]) -> None:
+        for drone_id, target in assigned_targets.items():
+            drone = self.drones[drone_id]
+            distance_before = manhattan_distance(drone.position, target)
+            movement_distance = 0.0 if distance_before == 0 else 1.0
+            drone.move_toward_target(target, self.grid_size)
+            distance_after = manhattan_distance(drone.position, target)
+            progress = max(0, distance_before - distance_after)
+            self.metrics["target_progress_sum"] += float(progress)
+            self.metrics["movement_distance_sum"] += movement_distance
+        movement_total = self.metrics["movement_distance_sum"]
+        self.metrics["path_efficiency"] = (
+            self.metrics["target_progress_sum"] / movement_total if movement_total else 0.0
+        )
 
     def _compute_step_reward(
         self,
@@ -393,6 +594,12 @@ class DisasterSurveillanceEnvironment(
         self.metrics["grid_coverage_percent"] = 100.0 * self.metrics["grid_coverage"]
 
     def _sync_priority_metrics(self) -> None:
+        pending_by_severity = {severity: 0 for severity in SEVERITY_CONFIG}
+        for event in self.events:
+            if not event.detected:
+                pending_by_severity[event.severity] += 1
+        self.metrics["pending_by_severity"] = pending_by_severity
+
         latencies_by_severity = self.metrics["_latencies_by_severity"]
         for severity, values in latencies_by_severity.items():
             self.metrics["avg_latency_by_severity"][severity] = (
@@ -487,7 +694,12 @@ class DisasterSurveillanceEnvironment(
         self.metrics["episode_bonus_breakdown"] = breakdown
         return episode_bonus, breakdown
 
-    def _build_current_observation(self, reward: float, done: bool) -> DisasterObservation:
+    def _build_current_observation(
+        self,
+        reward: float,
+        done: bool,
+        coordinator_observation: Optional[Dict[str, Any]] = None,
+    ) -> DisasterObservation:
         public_metrics = build_team_metrics(
             drones=self.drones,
             grid_size=self.grid_size,
@@ -504,6 +716,8 @@ class DisasterSurveillanceEnvironment(
             reward=reward,
             done=done,
             event_memory_limit=self.EVENT_MEMORY_LIMIT,
+            coordinator_observation=coordinator_observation or self.last_coordinator_observation,
+            assigned_targets=self.last_assigned_targets,
         )
 
 
@@ -511,12 +725,13 @@ def _print_severity_metrics(metrics: Mapping[str, Any]) -> None:
     print("Severity metrics:")
     for severity in SEVERITY_CONFIG:
         print(
-            "  {severity}: spawned={spawned} detected={detected} on_time={on_time} missed={missed} avg_latency={latency}".format(
+            "  {severity}: spawned={spawned} detected={detected} on_time={on_time} missed={missed} pending={pending} avg_latency={latency}".format(
                 severity=severity,
                 spawned=metrics["events_spawned_by_severity"][severity],
                 detected=metrics["events_detected_by_severity"][severity],
                 on_time=metrics["detected_on_time_by_severity"][severity],
                 missed=metrics["missed_by_severity"][severity],
+                pending=metrics["pending_by_severity"][severity],
                 latency=metrics["avg_latency_by_severity"][severity],
             )
         )
@@ -545,10 +760,22 @@ def run_random_episode(
         print(observation.model_dump())
 
     while not observation.done:
-        actions = {agent_id: int(env.rng.integers(0, 5)) for agent_id in env.agent_ids}
-        observation = env.step(DroneActions(actions=actions))
+        action: DroneActions | Dict[str, Any]
+        if level == 6:
+            coordinator_observation = env.build_coordinator_observation()
+            action = None
+            if render:
+                print(f"\nCoordinator observation at t={env.timestep}: {coordinator_observation}")
+                print(f"Drone positions before move: {coordinator_observation['drone_positions']}")
+        else:
+            action = DroneActions(actions={agent_id: int(env.rng.integers(0, 5)) for agent_id in env.agent_ids})
+
+        observation = env.step(action)
         if render:
-            print(f"\nt={env.timestep} reward={observation.reward} actions={actions}")
+            print(f"t={observation.metadata['processed_timestep']} reward={observation.reward}")
+            print(f"Assigned targets: {env.last_assigned_targets}")
+            positions_after_move = {drone_id: agent_obs["position"] for drone_id, agent_obs in observation.agents.items()}
+            print(f"Drone positions after move: {positions_after_move}")
             print(env.render_ascii())
 
     public_metrics = {key: value for key, value in env.metrics.items() if not key.startswith("_")}
@@ -558,6 +785,16 @@ def run_random_episode(
             print(f"{key}: {value}")
         _print_severity_metrics(public_metrics)
         _print_reward_breakdown(public_metrics)
+        if level == 6:
+            print("Coordinator summary:")
+            print(f"  coordinator_backend: {public_metrics['coordinator_backend']}")
+            print(f"  coordinator_model_name: {public_metrics['coordinator_model_name']}")
+            print(f"  coordinator_decision_source: {public_metrics['coordinator_decision_source']}")
+            print(f"  coordinator_fallback_count: {public_metrics['coordinator_fallback_count']}")
+            print(f"  coordinator_fallback_reason: {public_metrics['coordinator_fallback_reason']}")
+            print(f"  last_assigned_targets: {public_metrics['last_assigned_targets']}")
+            print(f"  path_efficiency: {public_metrics['path_efficiency']:.2f}")
+            print(f"  coordination_quality: {public_metrics['coordination_quality']:.2f}")
         print(f"\nTotal reward: {public_metrics['total_reward']}")
         print(f"Coverage %: {public_metrics['grid_coverage_percent']:.1f}")
     return public_metrics
@@ -587,7 +824,7 @@ def run_random_episodes(
             print(
                 "episode={episode} seed={seed} level={level} total_reward={reward:.1f} "
                 "detected={detected} missed={missed} high_miss_rate={high_miss:.2f} "
-                "coverage={coverage:.1f}%".format(
+                "coverage={coverage:.1f}% path_efficiency={path_efficiency:.2f}".format(
                     episode=episode_index + 1,
                     seed=episode_seed,
                     level=level,
@@ -596,6 +833,7 @@ def run_random_episodes(
                     missed=metrics["events_missed"],
                     high_miss=metrics["high_priority_miss_rate"],
                     coverage=metrics["grid_coverage_percent"],
+                    path_efficiency=metrics.get("path_efficiency", 0.0),
                 )
             )
 
@@ -603,12 +841,14 @@ def run_random_episodes(
         mean_reward = float(np.mean([metrics["total_reward"] for metrics in all_metrics]))
         mean_coverage = float(np.mean([metrics["grid_coverage_percent"] for metrics in all_metrics]))
         mean_high_miss = float(np.mean([metrics["high_priority_miss_rate"] for metrics in all_metrics]))
+        mean_path_efficiency = float(np.mean([metrics.get("path_efficiency", 0.0) for metrics in all_metrics]))
         print("\nAggregate metrics:")
         print(f"episodes: {episodes}")
         print(f"level: {level}")
         print(f"mean_total_reward: {mean_reward:.2f}")
         print(f"mean_coverage_percent: {mean_coverage:.2f}")
         print(f"mean_high_priority_miss_rate: {mean_high_miss:.2f}")
+        print(f"mean_path_efficiency: {mean_path_efficiency:.2f}")
 
     return all_metrics
 
@@ -618,9 +858,9 @@ def main() -> None:
     parser.add_argument(
         "--level",
         type=int,
-        choices=[3, 4, 5],
+        choices=[3, 4, 5, 6],
         default=4,
-        help="Environment level: 3 baseline, 4 shaped coordination, or 5 long-horizon urgency.",
+        help="Environment level: 3 baseline, 4 shaped coordination, 5 urgency, or 6 coordinator control.",
     )
     parser.add_argument("--episodes", "-k", type=int, default=1, help="Number of episodes to run.")
     parser.add_argument("--seed", type=int, default=42, help="Base random seed. Episode i uses seed + i.")

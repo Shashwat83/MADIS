@@ -11,11 +11,16 @@ requires-python = ">=3.10"
 dependencies = [
     "openenv-core[core]>=0.2.3",
     "numpy>=2.0",
+    "openai>=1.76.0",
 ]
 
 [project.optional-dependencies]
 dev = [
     "pytest>=8.0.0",
+]
+llm = [
+    "transformers>=4.45.0",
+    "torch>=2.2.0",
 ]
 
 [project.scripts]

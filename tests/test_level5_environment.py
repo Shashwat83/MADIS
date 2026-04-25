@@ -2,11 +2,14 @@ from __future__ import annotations
 
 import numpy as np
 
+from disaster_surveillance_env.coordinator import HeuristicCoordinator, LLMCoordinator
 from disaster_surveillance_env.models import (
+    DroneActions,
     Event,
     compute_episode_bonus,
     compute_event_reward,
     compute_miss_penalty,
+    move_toward_target,
     sample_event_location_with_hotspots,
 )
 from disaster_surveillance_env.server.disaster_surveillance_environment import (
@@ -100,3 +103,101 @@ def test_level5_step_applies_episode_bonus_and_metrics() -> None:
     assert obs.metadata["episode_bonus"] == 70.0
     assert env.metrics["total_episode_bonus"] == 70.0
     assert env.metrics["reward_breakdown"]["episode_bonus"] == 70.0
+
+
+def test_move_toward_target_moves_one_step() -> None:
+    next_position, action = move_toward_target((2, 2), (5, 2))
+    assert next_position == (3, 2)
+    assert action == 3
+
+
+def test_level6_heuristic_coordinator_assigns_targets() -> None:
+    coordinator = HeuristicCoordinator()
+    targets = coordinator.act(
+        {
+            "grid_size": 10,
+            "drone_positions": {"drone_1": (0, 0), "drone_2": (9, 0), "drone_3": (5, 9)},
+            "visible_active_events": [],
+            "known_detected_events": [],
+            "team_frontier_cells": [(1, 1), (8, 1), (5, 8)],
+            "recently_observed_cells": [],
+        }
+    )
+    assert set(targets) == {"drone_1", "drone_2", "drone_3"}
+    assert len(set(targets.values())) == 3
+
+
+def test_level6_step_moves_drones_toward_targets_and_logs_assignment() -> None:
+    env = DisasterSurveillanceEnvironment(level=6, seed=2, p_spawn=0.0)
+    env.reset(seed=2)
+    start_positions = {drone_id: drone.position for drone_id, drone in env.drones.items()}
+    targets = {drone_id: (9, 9) for drone_id in env.agent_ids}
+
+    obs = env.step(DroneActions(targets=targets))
+
+    for drone_id, start in start_positions.items():
+        end = obs.agents[drone_id]["position"]
+        assert abs(end[0] - start[0]) + abs(end[1] - start[1]) <= 1
+    assert obs.metadata["assigned_targets"] == targets
+    assert env.metrics["target_assignment_count"] == 1
+
+
+def test_level6_rejects_direct_drone_actions() -> None:
+    env = DisasterSurveillanceEnvironment(level=6, seed=3, p_spawn=0.0)
+    env.reset(seed=3)
+
+    try:
+        env.step(DroneActions(actions={agent_id: 4 for agent_id in env.agent_ids}))
+    except ValueError as exc:
+        assert "does not accept direct per-drone movement actions" in str(exc)
+    else:
+        raise AssertionError("Level 6 should reject direct movement actions.")
+
+
+def test_llm_coordinator_parses_json_targets() -> None:
+    class FakeBackend:
+        def generate(self, prompt: str) -> str:
+            assert "Return JSON only" in prompt
+            return '{"drone_1": [1, 2], "drone_2": [3, 4], "drone_3": [5, 6]}'
+
+    coordinator = LLMCoordinator(backend=FakeBackend(), model_name="fake-small")
+    decision = coordinator.decide(
+        {
+            "timestep": 0,
+            "grid_size": 10,
+            "drone_positions": {"drone_1": (0, 0), "drone_2": (1, 1), "drone_3": (2, 2)},
+            "visible_active_events": [],
+            "known_detected_events": [],
+            "team_frontier_cells": [],
+            "recently_observed_cells": [],
+            "recent_team_coverage_ratio": 0.1,
+        }
+    )
+
+    assert decision.targets == {"drone_1": (1, 2), "drone_2": (3, 4), "drone_3": (5, 6)}
+    assert decision.metadata["decision_source"] == "llm"
+    assert decision.metadata["model_name"] == "fake-small"
+
+
+def test_llm_coordinator_falls_back_to_heuristic_on_backend_failure() -> None:
+    class FailingBackend:
+        def generate(self, prompt: str) -> str:
+            raise RuntimeError("backend unavailable")
+
+    coordinator = LLMCoordinator(backend=FailingBackend(), model_name="fake-small")
+    decision = coordinator.decide(
+        {
+            "timestep": 0,
+            "grid_size": 10,
+            "drone_positions": {"drone_1": (0, 0), "drone_2": (9, 0), "drone_3": (5, 9)},
+            "visible_active_events": [],
+            "known_detected_events": [],
+            "team_frontier_cells": [(1, 1), (8, 1), (5, 8)],
+            "recently_observed_cells": [],
+            "recent_team_coverage_ratio": 0.0,
+        }
+    )
+
+    assert set(decision.targets) == {"drone_1", "drone_2", "drone_3"}
+    assert decision.metadata["decision_source"] == "heuristic_fallback"
+    assert "backend unavailable" in decision.metadata["fallback_reason"]

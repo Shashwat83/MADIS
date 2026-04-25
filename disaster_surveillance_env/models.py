@@ -70,6 +70,7 @@ class Drone:
     steps_taken: int = 0
     detected_event_history: List[Dict[str, Any]] = field(default_factory=list)
     remembered_detected_event_ids: set[int] = field(default_factory=set)
+    current_target: Optional[Coord] = None
 
     def move(self, action: int, grid_size: int) -> None:
         x, y = self.position
@@ -91,11 +92,23 @@ class Drone:
             self.revisit_count += 1
         self.visited_cells.add(self.position)
 
+    def move_toward_target(self, target: Coord, grid_size: int) -> Coord:
+        next_position, action = move_toward_target(self.position, target)
+        self.current_target = target
+        self.move(action, grid_size)
+        self.position = next_position
+        self.visited_cells.add(self.position)
+        return self.position
+
 
 class DroneActions(Action):
-    actions: Dict[str, int] = Field(
-        ...,
-        description="Per-agent actions keyed by drone id. 0=UP, 1=DOWN, 2=LEFT, 3=RIGHT, 4=STAY.",
+    actions: Optional[Dict[str, int]] = Field(
+        default=None,
+        description="Legacy per-agent movement actions. 0=UP, 1=DOWN, 2=LEFT, 3=RIGHT, 4=STAY.",
+    )
+    targets: Optional[Dict[str, Coord]] = Field(
+        default=None,
+        description="Coordinator-assigned target coordinates per drone for Level 6.",
     )
 
 
@@ -103,6 +116,7 @@ class DisasterObservation(Observation):
     timestep: int
     agents: Dict[str, Dict[str, Any]]
     metrics: Dict[str, Any]
+    coordinator: Optional[Dict[str, Any]] = None
 
 
 class DisasterState(State):
@@ -126,6 +140,25 @@ def compute_fov(position: Coord, grid_size: int, radius: int = 2) -> set[Coord]:
 
 def get_fov_cells(drone: Drone, grid_size: int, radius: int = 2) -> set[Coord]:
     return compute_fov(drone.position, grid_size, radius)
+
+
+def move_toward_target(current_pos: Coord, target_pos: Coord) -> Tuple[Coord, int]:
+    current_x, current_y = current_pos
+    target_x, target_y = target_pos
+
+    if current_x < target_x:
+        return (current_x + 1, current_y), 3
+    if current_x > target_x:
+        return (current_x - 1, current_y), 2
+    if current_y < target_y:
+        return (current_x, current_y + 1), 1
+    if current_y > target_y:
+        return (current_x, current_y - 1), 0
+    return current_pos, 4
+
+
+def manhattan_distance(left: Coord, right: Coord) -> int:
+    return abs(left[0] - right[0]) + abs(left[1] - right[1])
 
 
 def sample_event_severity(rng: np.random.Generator) -> str:
@@ -291,10 +324,13 @@ def build_observation(
     reward: float,
     done: bool,
     event_memory_limit: int = 5,
+    coordinator_observation: Optional[Dict[str, Any]] = None,
+    assigned_targets: Optional[Mapping[str, Coord]] = None,
 ) -> DisasterObservation:
     agent_obs: Dict[str, Dict[str, Any]] = {}
     active_events = [event for event in events if event.is_active(timestep) and not event.detected]
     total_cells = grid_size * grid_size
+    assigned_targets = assigned_targets or {}
 
     for drone_id, drone in drones.items():
         visible_events = [
@@ -321,6 +357,7 @@ def build_observation(
         ]
         agent_obs[drone_id] = {
             "position": drone.position,
+            "assigned_target": assigned_targets.get(drone_id),
             "visible_cells": sorted(fovs[drone_id]),
             "visible_events": visible_events,
             "local_visited_cells": sorted(cell for cell in fovs[drone_id] if cell in drone.visited_cells),
@@ -345,6 +382,7 @@ def build_observation(
         metrics=dict(metrics),
         reward=reward,
         done=done,
+        coordinator=coordinator_observation,
     )
 
 
@@ -484,7 +522,7 @@ def build_team_metrics(
     surveilled_cells = team_visited_cells if team_visited_cells is not None else movement_visited_cells
     return {
         **dict(metrics),
-        "coordination_mode": "decentralized_no_communication",
+        "coordination_mode": metrics.get("coordination_mode", "decentralized_no_communication"),
         "reward_mode": metrics.get("reward_mode", "shared_global_overlap_and_coverage_shaping"),
         "team_unique_cells_visited": len(movement_visited_cells),
         "team_coverage_ratio": len(movement_visited_cells) / float(total_cells),
@@ -498,6 +536,7 @@ def build_team_metrics(
                 "revisit_count": drone.revisit_count,
                 "steps_taken": drone.steps_taken,
                 "last_action": ACTION_LABELS[drone.last_action],
+                "current_target": drone.current_target,
                 "detected_event_history_size": len(drone.detected_event_history),
             }
             for drone_id, drone in drones.items()
@@ -510,6 +549,8 @@ def normalize_actions(
     agent_ids: Sequence[str],
 ) -> Dict[str, int]:
     if isinstance(action, DroneActions):
+        if action.actions is None:
+            raise ValueError("Legacy movement action payload is missing 'actions'.")
         actions = action.actions
     elif isinstance(action, Mapping):
         actions = dict(action)
@@ -528,3 +569,35 @@ def normalize_actions(
             raise ValueError(f"{drone_id} action must be one of {sorted(VALID_MOVES)}; got {value}.")
 
     return {drone_id: int(value) for drone_id, value in actions.items()}
+
+
+def normalize_targets(
+    action: DroneActions | Mapping[str, Coord] | Sequence[Coord],
+    agent_ids: Sequence[str],
+    grid_size: int,
+) -> Dict[str, Coord]:
+    if isinstance(action, DroneActions):
+        if action.targets is None:
+            raise ValueError("Coordinator target payload is missing 'targets'.")
+        targets = action.targets
+    elif isinstance(action, Mapping):
+        targets = dict(action)
+    else:
+        if len(action) != len(agent_ids):
+            raise ValueError(f"Expected {len(agent_ids)} targets, got {len(action)}.")
+        targets = dict(zip(agent_ids, action))
+
+    missing = set(agent_ids) - set(targets)
+    extra = set(targets) - set(agent_ids)
+    if missing or extra:
+        raise ValueError(f"Target keys must match {list(agent_ids)}; missing={sorted(missing)}, extra={sorted(extra)}.")
+
+    normalized: Dict[str, Coord] = {}
+    for drone_id, value in targets.items():
+        if len(value) != 2:
+            raise ValueError(f"{drone_id} target must be a 2D coordinate; got {value}.")
+        x = int(np.clip(int(value[0]), 0, grid_size - 1))
+        y = int(np.clip(int(value[1]), 0, grid_size - 1))
+        normalized[drone_id] = (x, y)
+
+    return normalized
