@@ -10,6 +10,7 @@ Current setup is `Level 4 (Implicit Coordination via Reward Shaping)`:
 - 3 independent RL drone agents
 - each drone receives local observations and a shared global reward
 - reward includes event detection, missed-event, timestep, FOV overlap, and team coverage terms
+- Level 3 baseline mode is also available and keeps only the basic shared reward
 - team-level FOV coverage is tracked without double counting overlapping visible cells
 - no communication between agents
 - no centralized controller
@@ -43,5 +44,17 @@ python -m disaster_surveillance_env.server.app --port 8000
 Run the local random rollout:
 
 ```bash
-python3 scripts/run_random_episode.py
+python3 scripts/run_random_episode.py --level 4 --episodes 1
+```
+
+Run the Level 3 baseline:
+
+```bash
+python3 scripts/run_random_episode.py --level 3
+```
+
+Run `k` episodes:
+
+```bash
+python3 scripts/run_random_episode.py --level 4 --episodes 10
 ```

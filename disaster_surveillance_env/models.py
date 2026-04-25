@@ -230,6 +230,30 @@ def compute_reward(
     }
 
 
+def compute_baseline_reward(
+    *,
+    detected_count: int,
+    missed_count: int,
+    fovs: Mapping[str, set[Coord]],
+    visited_cells: set[Coord],
+) -> Tuple[float, Dict[str, Any]]:
+    reward = -1.0 + 20.0 * detected_count - 20.0 * missed_count
+    _, overlap_info = compute_overlap_penalty(fovs)
+    _, current_visible_cells, new_cells = compute_coverage_reward(
+        fov_sets=fovs,
+        visited_cells=visited_cells,
+        reward_per_new_cell=0.0,
+    )
+    return reward, {
+        **overlap_info,
+        "overlap_penalty": 0.0,
+        "coverage_reward": 0.0,
+        "current_visible_cells": len(current_visible_cells),
+        "new_cells_covered": len(new_cells),
+        "new_cells": sorted(new_cells),
+    }
+
+
 def compute_grid_coverage(visited_cells: set[Coord], grid_size: int) -> float:
     return len(visited_cells) / float(grid_size * grid_size)
 

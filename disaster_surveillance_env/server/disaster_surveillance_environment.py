@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import argparse
 from typing import Any, Dict, Mapping, Optional, Sequence
 from uuid import uuid4
 
@@ -17,6 +18,7 @@ from ..models import (
     Event,
     build_observation,
     build_team_metrics,
+    compute_baseline_reward,
     compute_grid_coverage,
     compute_reward,
     get_fov_cells,
@@ -47,9 +49,14 @@ class DisasterSurveillanceEnvironment(
         fov_radius: int = FOV_RADIUS,
         p_spawn: float = P_SPAWN,
         coverage_reward_per_new_cell: float = COVERAGE_REWARD_PER_NEW_CELL,
+        level: int = 4,
         seed: Optional[int] = None,
     ) -> None:
         super().__init__()
+        if level not in {3, 4}:
+            raise ValueError(f"level must be 3 or 4; got {level}.")
+
+        self.level = level
         self.grid_size = grid_size
         self.episode_length = episode_length
         self.agent_ids = [f"drone_{index + 1}" for index in range(n_drones)]
@@ -63,7 +70,7 @@ class DisasterSurveillanceEnvironment(
             "type": "per_agent_partial_observation",
             "coordination": "decentralized",
             "communication": "none",
-            "reward_mode": "shared_global_overlap_and_coverage_shaping",
+            "reward_mode": self.reward_mode,
             "agents": self.agent_ids,
             "position": {"shape": [2], "dtype": "int"},
             "visible_cells": {"shape": ["variable", 2], "dtype": "int"},
@@ -94,9 +101,15 @@ class DisasterSurveillanceEnvironment(
     def get_metadata(self) -> EnvironmentMetadata:
         return EnvironmentMetadata(
             name="disaster-surveillance-grid",
-            description="Level 4 decentralized coordination environment with implicit FOV overlap and coverage reward shaping.",
-            version="0.2.0",
+            description="Decentralized disaster surveillance environment supporting Level 3 baseline and Level 4 reward-shaped coordination.",
+            version="0.3.0",
         )
+
+    @property
+    def reward_mode(self) -> str:
+        if self.level == 3:
+            return "shared_global_baseline"
+        return "shared_global_overlap_and_coverage_shaping"
 
     @property
     def state(self) -> DisasterState:
@@ -160,9 +173,9 @@ class DisasterSurveillanceEnvironment(
         for drone in self.drones.values():
             drone.visited_cells.add(drone.position)
         self.metrics = {
-            "level": 4,
+            "level": self.level,
             "coordination_mode": "decentralized_no_communication",
-            "reward_mode": "shared_global_overlap_and_coverage_shaping",
+            "reward_mode": self.reward_mode,
             "total_events_spawned": 0,
             "events_detected": 0,
             "events_missed": 0,
@@ -212,12 +225,10 @@ class DisasterSurveillanceEnvironment(
         detected_count = self._detect_events(fovs)
         missed_count = self._remove_detected_and_expired()
 
-        reward, reward_info = compute_reward(
+        reward, reward_info = self._compute_step_reward(
             detected_count=detected_count,
             missed_count=missed_count,
             fovs=fovs,
-            visited_cells=self.visited_cells,
-            reward_per_new_cell=self.coverage_reward_per_new_cell,
         )
         self._apply_reward_metrics(reward_info)
         self.metrics["total_reward"] += reward
@@ -230,7 +241,7 @@ class DisasterSurveillanceEnvironment(
         observation.metadata["last_step_detected"] = detected_count
         observation.metadata["last_step_missed"] = missed_count
         observation.metadata["coordination_mode"] = "decentralized_no_communication"
-        observation.metadata["reward_mode"] = "shared_global_overlap_and_coverage_shaping"
+        observation.metadata["reward_mode"] = self.reward_mode
         return observation
 
     def render_ascii(self) -> str:
@@ -256,6 +267,29 @@ class DisasterSurveillanceEnvironment(
         initial_fovs = self._compute_fovs()
         initial_visible_cells = set().union(*initial_fovs.values()) if initial_fovs else set()
         self.visited_cells.update(initial_visible_cells)
+
+    def _compute_step_reward(
+        self,
+        *,
+        detected_count: int,
+        missed_count: int,
+        fovs: Mapping[str, set[Coord]],
+    ) -> tuple[float, Dict[str, Any]]:
+        if self.level == 3:
+            return compute_baseline_reward(
+                detected_count=detected_count,
+                missed_count=missed_count,
+                fovs=fovs,
+                visited_cells=self.visited_cells,
+            )
+
+        return compute_reward(
+            detected_count=detected_count,
+            missed_count=missed_count,
+            fovs=fovs,
+            visited_cells=self.visited_cells,
+            reward_per_new_cell=self.coverage_reward_per_new_cell,
+        )
 
     def _apply_reward_metrics(self, reward_info: Mapping[str, Any]) -> None:
         self.visited_cells.update(reward_info["new_cells"])
@@ -316,11 +350,17 @@ class DisasterSurveillanceEnvironment(
         )
 
 
-def run_random_episode(seed: int = 7, render: bool = False) -> Dict[str, Any]:
-    env = DisasterSurveillanceEnvironment(seed=seed)
+def run_random_episode(
+    seed: int = 7,
+    render: bool = False,
+    level: int = 4,
+    verbose: bool = True,
+) -> Dict[str, Any]:
+    env = DisasterSurveillanceEnvironment(seed=seed, level=level)
     observation = env.reset(seed=seed)
-    print("Initial observation:")
-    print(observation.model_dump())
+    if verbose:
+        print("Initial observation:")
+        print(observation.model_dump())
 
     while not observation.done:
         actions = {agent_id: int(env.rng.integers(0, 5)) for agent_id in env.agent_ids}
@@ -329,17 +369,83 @@ def run_random_episode(seed: int = 7, render: bool = False) -> Dict[str, Any]:
             print(f"\nt={env.timestep} reward={observation.reward} actions={actions}")
             print(env.render_ascii())
 
-    print("\nFinal metrics:")
-    for key, value in env.metrics.items():
-        print(f"{key}: {value}")
-    print(f"\nTotal reward: {env.metrics['total_reward']}")
-    print(f"Overlap penalty: {env.metrics['total_overlap_penalty']}")
-    print(f"Coverage %: {env.metrics['grid_coverage_percent']:.1f}")
+    if verbose:
+        print("\nFinal metrics:")
+        for key, value in env.metrics.items():
+            print(f"{key}: {value}")
+        print(f"\nTotal reward: {env.metrics['total_reward']}")
+        print(f"Overlap penalty: {env.metrics['total_overlap_penalty']}")
+        print(f"Coverage %: {env.metrics['grid_coverage_percent']:.1f}")
     return env.metrics
 
 
+def run_random_episodes(
+    *,
+    episodes: int = 1,
+    seed: int = 7,
+    level: int = 4,
+    render: bool = False,
+) -> list[Dict[str, Any]]:
+    if episodes < 1:
+        raise ValueError(f"episodes must be >= 1; got {episodes}.")
+
+    all_metrics: list[Dict[str, Any]] = []
+    for episode_index in range(episodes):
+        episode_seed = seed + episode_index
+        metrics = run_random_episode(
+            seed=episode_seed,
+            render=render and episodes == 1,
+            level=level,
+            verbose=episodes == 1,
+        )
+        all_metrics.append(metrics)
+        if episodes > 1:
+            print(
+                "episode={episode} seed={seed} level={level} total_reward={reward:.1f} "
+                "detected={detected} missed={missed} coverage={coverage:.1f}% "
+                "overlap_penalty={overlap:.1f}".format(
+                    episode=episode_index + 1,
+                    seed=episode_seed,
+                    level=level,
+                    reward=metrics["total_reward"],
+                    detected=metrics["events_detected"],
+                    missed=metrics["events_missed"],
+                    coverage=metrics["grid_coverage_percent"],
+                    overlap=metrics["total_overlap_penalty"],
+                )
+            )
+
+    if episodes > 1:
+        mean_reward = float(np.mean([metrics["total_reward"] for metrics in all_metrics]))
+        mean_coverage = float(np.mean([metrics["grid_coverage_percent"] for metrics in all_metrics]))
+        mean_overlap = float(np.mean([metrics["total_overlap_penalty"] for metrics in all_metrics]))
+        total_detected = sum(metrics["events_detected"] for metrics in all_metrics)
+        total_missed = sum(metrics["events_missed"] for metrics in all_metrics)
+        print("\nAggregate metrics:")
+        print(f"episodes: {episodes}")
+        print(f"level: {level}")
+        print(f"mean_total_reward: {mean_reward:.2f}")
+        print(f"mean_coverage_percent: {mean_coverage:.2f}")
+        print(f"mean_overlap_penalty: {mean_overlap:.2f}")
+        print(f"total_events_detected: {total_detected}")
+        print(f"total_events_missed: {total_missed}")
+
+    return all_metrics
+
+
 def main() -> None:
-    run_random_episode(seed=42, render=False)
+    parser = argparse.ArgumentParser(description="Run random rollouts for the disaster surveillance environment.")
+    parser.add_argument("--level", type=int, choices=[3, 4], default=4, help="Environment level: 3 baseline or 4 shaped coordination.")
+    parser.add_argument("--episodes", "-k", type=int, default=1, help="Number of episodes to run.")
+    parser.add_argument("--seed", type=int, default=42, help="Base random seed. Episode i uses seed + i.")
+    parser.add_argument("--render", action="store_true", help="Render ASCII grid per step. Only enabled for a single episode.")
+    args = parser.parse_args()
+    run_random_episodes(
+        episodes=args.episodes,
+        seed=args.seed,
+        level=args.level,
+        render=args.render,
+    )
 
 
 if __name__ == "__main__":
