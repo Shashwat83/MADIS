@@ -12,7 +12,7 @@ ROOT = Path(__file__).resolve().parents[1]
 if str(ROOT) not in sys.path:
     sys.path.insert(0, str(ROOT))
 
-from disaster_surveillance_env.coordinator import DEFAULT_REMOTE_LLM
+from disaster_surveillance_env.coordinator import get_configured_model_name
 from disaster_surveillance_env.models import DroneActions
 from disaster_surveillance_env.server.disaster_surveillance_environment import DisasterSurveillanceEnvironment
 
@@ -27,42 +27,52 @@ REWARD_BREAKDOWN_KEYS = (
 )
 
 
-def run_baseline_episode(seed: int, level: int = 3) -> Dict[str, Any]:
-    env = DisasterSurveillanceEnvironment(seed=seed, level=level)
+def run_analysis_episode(seed: int, level: int = 6, episode_length: int | None = None) -> Dict[str, Any]:
+    env_kwargs: Dict[str, Any] = {"seed": seed, "level": level}
+    if episode_length is not None:
+        env_kwargs["episode_length"] = episode_length
+    env = DisasterSurveillanceEnvironment(**env_kwargs)
     observation = env.reset(seed=seed)
 
     while not observation.done:
-        actions = {
-            agent_id: int(env.rng.integers(0, 5))
-            for agent_id in env.agent_ids
-        }
-        observation = env.step(DroneActions(actions=actions))
+        if level == 6:
+            observation = env.step(None)
+        else:
+            actions = {
+                agent_id: int(env.rng.integers(0, 5))
+                for agent_id in env.agent_ids
+            }
+            observation = env.step(DroneActions(actions=actions))
 
     metrics = {key: value for key, value in env.metrics.items() if not key.startswith("_")}
     total_steps = sum(drone.steps_taken for drone in env.drones.values())
     useful_cells = float(metrics.get("unique_cells_visited", 0))
-    metrics["derived_path_efficiency"] = useful_cells / float(total_steps or 1)
+    metrics["derived_path_efficiency"] = (
+        float(metrics.get("path_efficiency", 0.0))
+        if level == 6
+        else useful_cells / float(total_steps or 1)
+    )
 
     target_assignments = int(metrics.get("target_assignment_count", 0))
     fallback_count = int(metrics.get("coordinator_fallback_count", 0))
     metrics["derived_fallback_rate"] = fallback_count / float(target_assignments or 1)
-    metrics["model_name"] = DEFAULT_REMOTE_LLM
-    metrics["policy_type"] = "baseline_random"
+    metrics["model_name"] = metrics.get("coordinator_model_name") or get_configured_model_name()
+    metrics["policy_type"] = "qwen_llm_coordinator" if level == 6 else "baseline_random"
     return metrics
 
 
-def run_episodes(episodes: int, seed: int, level: int) -> List[Dict[str, Any]]:
+def run_episodes(episodes: int, seed: int, level: int, episode_length: int | None = None) -> List[Dict[str, Any]]:
     results: List[Dict[str, Any]] = []
     for index in range(episodes):
         episode = index + 1
-        metrics = run_baseline_episode(seed=seed + index, level=level)
+        metrics = run_analysis_episode(seed=seed + index, level=level, episode_length=episode_length)
         metrics["episode"] = episode
         metrics["seed"] = seed + index
         results.append(metrics)
         if episode == 1 or episode % 25 == 0 or episode == episodes:
             print(
                 "episode={episode}/{episodes} reward={reward:.1f} coverage={coverage:.1f}% "
-                "detected={detected} missed={missed} high_miss={high_miss:.2f}".format(
+                "detected={detected} missed={missed} high_miss={high_miss:.2f} fallback_rate={fallback:.2f}".format(
                     episode=episode,
                     episodes=episodes,
                     reward=metrics["total_reward"],
@@ -70,6 +80,7 @@ def run_episodes(episodes: int, seed: int, level: int) -> List[Dict[str, Any]]:
                     detected=metrics["events_detected"],
                     missed=metrics["events_missed"],
                     high_miss=metrics["high_priority_miss_rate"],
+                    fallback=metrics["derived_fallback_rate"],
                 )
             )
     return results
@@ -332,6 +343,7 @@ def build_cache_rows(metrics: Sequence[Mapping[str, Any]]) -> Dict[str, List[Dic
                 "coordinator_fallback_count": item.get("coordinator_fallback_count", 0),
                 "target_assignment_count": item.get("target_assignment_count", 0),
                 "fallback_rate": item["derived_fallback_rate"],
+                "last_llm_diagnosis": (item.get("last_llm_debug") or {}).get("diagnosis"),
             }
         )
         rows["all_metrics"].append(
@@ -350,6 +362,9 @@ def build_cache_rows(metrics: Sequence[Mapping[str, Any]]) -> Dict[str, List[Dic
                 "path_efficiency": item["derived_path_efficiency"],
                 "fallback_rate": item["derived_fallback_rate"],
                 "coordinator_decision_source": source,
+                "coordinator_fallback_count": item.get("coordinator_fallback_count", 0),
+                "target_assignment_count": item.get("target_assignment_count", 0),
+                "last_llm_diagnosis": (item.get("last_llm_debug") or {}).get("diagnosis"),
             }
         )
     return rows
@@ -395,6 +410,7 @@ def save_outputs(metrics: Sequence[Mapping[str, Any]], output_dir: Path) -> None
             "coordinator_fallback_count",
             "target_assignment_count",
             "fallback_rate",
+            "last_llm_diagnosis",
         ],
     )
     write_csv(
@@ -415,6 +431,9 @@ def save_outputs(metrics: Sequence[Mapping[str, Any]], output_dir: Path) -> None
             "path_efficiency",
             "fallback_rate",
             "coordinator_decision_source",
+            "coordinator_fallback_count",
+            "target_assignment_count",
+            "last_llm_diagnosis",
         ],
     )
 
@@ -475,25 +494,38 @@ def save_outputs(metrics: Sequence[Mapping[str, Any]], output_dir: Path) -> None
     )
 
 
+def default_output_dir(level: int, episodes: int) -> Path:
+    if level == 6:
+        return ROOT / "outputs" / "evals" / f"qwen3_1_7b_level6_{episodes}"
+    return ROOT / "outputs" / "evals" / f"baseline_level{level}_{episodes}"
+
+
 def main() -> None:
-    parser = argparse.ArgumentParser(description="Run baseline analysis and cache plot datapoints.")
-    parser.add_argument("--episodes", "-k", type=int, default=400, help="Number of baseline episodes.")
+    parser = argparse.ArgumentParser(description="Run rollout analysis and cache plot datapoints.")
+    parser.add_argument("--episodes", "-k", type=int, default=4, help="Number of episodes.")
     parser.add_argument("--seed", type=int, default=42, help="Base random seed.")
-    parser.add_argument("--level", type=int, default=3, choices=[3], help="Baseline level to evaluate.")
+    parser.add_argument("--level", type=int, default=6, choices=[3, 4, 5, 6], help="Environment level to evaluate.")
+    parser.add_argument("--episode-length", type=int, default=None, help="Optional shorter episode length for debugging.")
     parser.add_argument(
         "--output-dir",
         type=Path,
-        default=ROOT / "outputs" / "evals" / "baseline_qwen3_1_7b_400",
+        default=None,
         help="Directory for CSV caches and plots.",
     )
     args = parser.parse_args()
+    output_dir = args.output_dir or default_output_dir(args.level, args.episodes)
 
-    print(f"Using coordinator/model label: {DEFAULT_REMOTE_LLM}")
-    print(f"Running baseline Level {args.level} for {args.episodes} episodes.")
-    metrics = run_episodes(episodes=args.episodes, seed=args.seed, level=args.level)
-    save_outputs(metrics, args.output_dir)
-    print(f"\nSaved CSV caches to: {args.output_dir / 'csv'}")
-    print(f"Saved plots to: {args.output_dir / 'plots'}")
+    print(f"Configured model: {get_configured_model_name()}")
+    print(f"Running Level {args.level} for {args.episodes} episodes.")
+    metrics = run_episodes(
+        episodes=args.episodes,
+        seed=args.seed,
+        level=args.level,
+        episode_length=args.episode_length,
+    )
+    save_outputs(metrics, output_dir)
+    print(f"\nSaved CSV caches to: {output_dir / 'csv'}")
+    print(f"Saved plots to: {output_dir / 'plots'}")
 
 
 if __name__ == "__main__":
