@@ -1,0 +1,2 @@
+openenv-core[core]>=0.2.3
+numpy>=2.0
