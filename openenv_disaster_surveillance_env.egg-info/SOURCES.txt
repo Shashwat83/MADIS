@@ -3,6 +3,7 @@ pyproject.toml
 disaster_surveillance_env/__init__.py
 disaster_surveillance_env/client.py
 disaster_surveillance_env/coordinator.py
+disaster_surveillance_env/local_qwen_backend.py
 disaster_surveillance_env/models.py
 disaster_surveillance_env/server/__init__.py
 disaster_surveillance_env/server/app.py

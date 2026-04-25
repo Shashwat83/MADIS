@@ -136,6 +136,18 @@ def _svg_text(x: float, y: float, text: str, size: int = 12, anchor: str = "star
     )
 
 
+def episode_axis_ticks(episodes: Sequence[int], max_ticks: int = 12) -> List[int]:
+    ticks = list(dict.fromkeys(int(episode) for episode in episodes))
+    if len(ticks) <= max_ticks:
+        return ticks
+
+    step = max(1, round(len(ticks) / float(max_ticks - 1)))
+    sampled = ticks[::step]
+    if ticks[-1] not in sampled:
+        sampled.append(ticks[-1])
+    return sampled
+
+
 def save_line_plot(
     path: Path,
     episodes: Sequence[int],
@@ -179,10 +191,8 @@ def save_line_plot(
         value = y_max - ratio * y_span
         elements.append(f'<line x1="{left}" y1="{y:.2f}" x2="{left + plot_w}" y2="{y:.2f}" stroke="#e5e7eb" />')
         elements.append(_svg_text(left - 10, y + 4, f"{value:.2f}", size=11, anchor="end"))
-    for tick in range(6):
-        ratio = tick / 5
-        x = left + ratio * plot_w
-        value = int(round(x_min + ratio * x_span))
+    for value in episode_axis_ticks(episodes):
+        x = sx(float(value))
         elements.append(f'<line x1="{x:.2f}" y1="{top}" x2="{x:.2f}" y2="{top + plot_h}" stroke="#f3f4f6" />')
         elements.append(_svg_text(x, top + plot_h + 22, str(value), size=11, anchor="middle"))
 
@@ -274,10 +284,10 @@ def save_reward_breakdown_plot(path: Path, rows: Sequence[Mapping[str, Any]]) ->
                 f'<rect x="{x:.2f}" y="{rect_y:.2f}" width="{bar_w:.2f}" height="{rect_h:.2f}" '
                 f'fill="{colors[key]}" opacity="0.9" />'
             )
-    for tick in range(6):
-        ratio = tick / 5
-        x = left + ratio * plot_w
-        value = int(round(episodes[0] + ratio * max(1, episodes[-1] - episodes[0])))
+    x_min, x_max = min(episodes), max(episodes)
+    x_span = max(1, x_max - x_min)
+    for value in episode_axis_ticks(episodes):
+        x = left + ((value - x_min) / x_span) * plot_w
         elements.append(_svg_text(x, top + plot_h + 22, str(value), size=11, anchor="middle"))
 
     for key in REWARD_BREAKDOWN_KEYS:
@@ -530,3 +540,4 @@ def main() -> None:
 
 if __name__ == "__main__":
     main()
+
