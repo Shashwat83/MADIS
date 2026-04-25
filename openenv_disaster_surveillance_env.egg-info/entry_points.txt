@@ -1,0 +1,3 @@
+[console_scripts]
+run-random-episode = disaster_surveillance_env.server.disaster_surveillance_environment:main
+server = disaster_surveillance_env.server.app:main

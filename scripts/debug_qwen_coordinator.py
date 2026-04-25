@@ -42,7 +42,10 @@ def main() -> None:
         "recent_team_coverage_ratio": 0.34,
         "known_detected_events": [],
     }
-    coordinator = LLMCoordinator()
+    from disaster_surveillance_env.local_qwen_backend import LocalQwenBackend
+    coordinator = LLMCoordinator(
+      backend=LocalQwenBackend("Qwen/Qwen3-1.7B")
+)
     decision = coordinator.decide(observation)
     print("targets:", decision.targets)
     print("metadata:")
