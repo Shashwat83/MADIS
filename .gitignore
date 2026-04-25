@@ -10,5 +10,6 @@ __pycache__/
 .DS_Store
 outputs/logs/*
 outputs/evals/*
+outputs/matplotlib_cache/
 !outputs/logs/.gitkeep
 !outputs/evals/.gitkeep

@@ -50,7 +50,7 @@ Run the local random rollout:
 python3 scripts/run_random_episode.py --level 6 --episodes 1
 ```
 
-Level 6 uses the small-model coordinator `HuggingFaceTB/SmolLM2-135M-Instruct` by default through Hugging Face inference when available. If inference is unavailable locally, the env falls back to the heuristic coordinator and logs that fallback in metrics.
+Level 6 uses the coordinator model `Qwen/Qwen3-1.7B` by default through Hugging Face inference when available. If inference is unavailable locally, the env falls back to the heuristic coordinator and logs that fallback in metrics.
 
 Run the Level 3 baseline:
 
@@ -62,6 +62,12 @@ Run `k` episodes:
 
 ```bash
 python3 scripts/run_random_episode.py --level 6 --episodes 10
+```
+
+Run the 400-episode baseline analysis and cache CSV/SVG plot data:
+
+```bash
+python3 scripts/analyze_baseline.py --episodes 400
 ```
 
 Run tests:

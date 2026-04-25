@@ -2,12 +2,17 @@ from __future__ import annotations
 
 import json
 import os
+import re
 import time
 from abc import ABC, abstractmethod
 from dataclasses import dataclass
 from typing import Any, Dict, List, Mapping, Optional, Protocol, Sequence, Tuple
 
+from dotenv import load_dotenv
+
 from .models import Coord, manhattan_distance
+
+load_dotenv()
 
 try:
     from openai import OpenAI
@@ -16,7 +21,16 @@ except Exception:  # pragma: no cover
 
 
 DEFAULT_ROUTER_BASE_URL = "https://router.huggingface.co/v1"
-DEFAULT_REMOTE_LLM = "Qwen/Qwen2.5-72B-Instruct:fastest"
+DEFAULT_REMOTE_LLM = "Qwen/Qwen3-1.7B"
+
+
+def get_configured_model_name(explicit_model_name: Optional[str] = None) -> str:
+    return (
+        explicit_model_name
+        or os.environ.get("HF_COORDINATOR_MODEL")
+        or os.environ.get("MODEL_NAME")
+        or DEFAULT_REMOTE_LLM
+    )
 
 
 class CoordinatorAgent(ABC):
@@ -35,6 +49,12 @@ class TextGenerationBackend(Protocol):
 @dataclass
 class CoordinatorDecision:
     targets: Dict[str, Coord]
+    metadata: Dict[str, Any]
+
+
+@dataclass
+class GenerationResult:
+    text: str
     metadata: Dict[str, Any]
 
 
@@ -145,7 +165,7 @@ class HFRouterOpenAIBackend:
 
     def __init__(
         self,
-        model_name: str = DEFAULT_REMOTE_LLM,
+        model_name: Optional[str] = None,
         api_token: Optional[str] = None,
         base_url: Optional[str] = None,
         timeout: float = 20.0,
@@ -153,7 +173,7 @@ class HFRouterOpenAIBackend:
         if OpenAI is None:
             raise RuntimeError("openai is not available.")
 
-        self.model_name = os.environ.get("MODEL_NAME", model_name)
+        self.model_name = get_configured_model_name(model_name)
         self.api_token = api_token or os.environ.get("HF_TOKEN")
         if not self.api_token:
             raise RuntimeError("HF_TOKEN is not set in the current shell environment.")
@@ -166,6 +186,9 @@ class HFRouterOpenAIBackend:
         )
 
     def generate(self, prompt: str) -> str:
+        return self.generate_with_metadata(prompt).text
+
+    def generate_with_metadata(self, prompt: str) -> GenerationResult:
         response = self.client.chat.completions.create(
             model=self.model_name,
             messages=[
@@ -181,10 +204,36 @@ class HFRouterOpenAIBackend:
             max_tokens=220,
             temperature=0.2,
         )
-        content = response.choices[0].message.content
+        response_payload = response.model_dump() if hasattr(response, "model_dump") else {}
+        choice = response.choices[0]
+        message = choice.message
+        message_payload = message.model_dump() if hasattr(message, "model_dump") else {}
+        content = message.content
+        reasoning_content = (
+            message_payload.get("reasoning_content")
+            or message_payload.get("reasoning")
+            or message_payload.get("reasoning_text")
+        )
+        text = "" if content is None else str(content)
+        metadata = {
+            "provider_base_url": self.base_url,
+            "response_model": response_payload.get("model"),
+            "response_id": response_payload.get("id"),
+            "finish_reason": getattr(choice, "finish_reason", None),
+            "message_role": getattr(message, "role", None),
+            "content_is_none": content is None,
+            "content_length": len(text),
+            "content_preview": text[:500],
+            "has_reasoning_content": bool(reasoning_content),
+            "reasoning_content_length": len(str(reasoning_content)) if reasoning_content else 0,
+            "reasoning_content_preview": str(reasoning_content)[:500] if reasoning_content else None,
+            "usage": response_payload.get("usage"),
+            "response_keys": sorted(response_payload.keys()),
+            "message_keys": sorted(message_payload.keys()),
+        }
         if content is None:
-            raise RuntimeError(f"Router returned an empty completion for model '{self.model_name}'.")
-        return str(content)
+            return GenerationResult(text="", metadata=metadata)
+        return GenerationResult(text=text, metadata=metadata)
 
 
 class LLMCoordinator(CoordinatorAgent):
@@ -196,7 +245,7 @@ class LLMCoordinator(CoordinatorAgent):
         model_name: Optional[str] = None,
         fallback: Optional[HeuristicCoordinator] = None,
     ) -> None:
-        self.model_name = model_name or os.environ.get("HF_COORDINATOR_MODEL") or os.environ.get("MODEL_NAME") or DEFAULT_REMOTE_LLM
+        self.model_name = get_configured_model_name(model_name)
         self.fallback = fallback or HeuristicCoordinator()
         self.backend = backend
         self.last_metadata: Dict[str, Any] = {}
@@ -211,6 +260,7 @@ class LLMCoordinator(CoordinatorAgent):
         prompt = self._build_prompt(observation)
         started_at = time.perf_counter()
         backend = self._ensure_backend()
+        raw_text: Optional[str] = None
         if backend is None:
             fallback_decision = self.fallback.decide(observation)
             fallback_decision.metadata.update(
@@ -224,7 +274,13 @@ class LLMCoordinator(CoordinatorAgent):
             return fallback_decision
 
         try:
-            raw_text = backend.generate(prompt)
+            if hasattr(backend, "generate_with_metadata"):
+                generation = backend.generate_with_metadata(prompt)
+                raw_text = generation.text
+                generation_metadata = generation.metadata
+            else:
+                raw_text = backend.generate(prompt)
+                generation_metadata = {}
             latency_ms = 1000.0 * (time.perf_counter() - started_at)
             targets = self._parse_targets(raw_text, observation)
             return CoordinatorDecision(
@@ -235,6 +291,7 @@ class LLMCoordinator(CoordinatorAgent):
                     "llm_enabled": True,
                     "llm_latency_ms": latency_ms,
                     "llm_raw_response": raw_text,
+                    "llm_debug": self._build_debug_summary(raw_text, generation_metadata, parse_error=None),
                 },
             )
         except Exception as exc:
@@ -247,9 +304,54 @@ class LLMCoordinator(CoordinatorAgent):
                     "model_name": self.model_name,
                     "llm_enabled": True,
                     "llm_latency_ms": latency_ms,
+                    "llm_raw_response": raw_text,
+                    "llm_debug": self._build_debug_summary(raw_text, locals().get("generation_metadata", {}), parse_error=exc),
                 }
             )
             return fallback_decision
+
+    def _build_debug_summary(
+        self,
+        raw_text: Optional[str],
+        generation_metadata: Mapping[str, Any],
+        parse_error: Optional[Exception],
+    ) -> Dict[str, Any]:
+        text = raw_text or ""
+        parse_error_text = f"{type(parse_error).__name__}: {parse_error}" if parse_error else None
+        content_length = int(generation_metadata.get("content_length", len(text)))
+        has_json_object = "{" in text and "}" in text
+        if parse_error_text and ("model_not_supported" in parse_error_text or "BadRequestError" in parse_error_text):
+            diagnosis = "provider_or_model_configuration_error"
+        elif parse_error_text and ("HF_TOKEN" in parse_error_text or "Authentication" in parse_error_text):
+            diagnosis = "provider_authentication_error"
+        elif parse_error is None:
+            diagnosis = "llm_json_parsed_successfully"
+        elif content_length == 0:
+            diagnosis = "provider_returned_blank_message_content"
+        elif generation_metadata.get("has_reasoning_content") and not has_json_object:
+            diagnosis = "provider_returned_reasoning_without_json_content"
+        elif not has_json_object:
+            diagnosis = "llm_response_missing_json_object"
+        else:
+            diagnosis = "llm_response_json_parse_or_schema_error"
+
+        return {
+            "diagnosis": diagnosis,
+            "parse_error": parse_error_text,
+            "content_length": content_length,
+            "content_preview": generation_metadata.get("content_preview", text[:500]),
+            "has_json_object": has_json_object,
+            "finish_reason": generation_metadata.get("finish_reason"),
+            "response_model": generation_metadata.get("response_model"),
+            "provider_base_url": generation_metadata.get("provider_base_url"),
+            "content_is_none": generation_metadata.get("content_is_none"),
+            "has_reasoning_content": generation_metadata.get("has_reasoning_content"),
+            "reasoning_content_length": generation_metadata.get("reasoning_content_length"),
+            "reasoning_content_preview": generation_metadata.get("reasoning_content_preview"),
+            "usage": generation_metadata.get("usage"),
+            "response_keys": generation_metadata.get("response_keys"),
+            "message_keys": generation_metadata.get("message_keys"),
+        }
 
     def _ensure_backend(self) -> Optional[TextGenerationBackend]:
         if self.backend is not None:
@@ -280,8 +382,11 @@ class LLMCoordinator(CoordinatorAgent):
             "Assign one target grid cell to each drone.\n"
             "Prioritize HIGH severity events, then MEDIUM, then LOW.\n"
             "Avoid assigning the same target to multiple drones unless necessary.\n"
-            "Return JSON only with the shape:\n"
+            "Do not include reasoning, markdown, code fences, prose, or <think> tags.\n"
+            "Return exactly one valid JSON object and nothing else.\n"
+            "The JSON object must have this shape:\n"
             '{"drone_1": [x, y], "drone_2": [x, y], "drone_3": [x, y]}\n'
+            "All x and y values must be integers inside the grid.\n"
             f"Observation:\n{json.dumps(compact_observation, separators=(',', ':'))}\n"
         )
 
@@ -290,12 +395,18 @@ class LLMCoordinator(CoordinatorAgent):
         raw_text: str,
         observation: Mapping[str, Any],
     ) -> Dict[str, Coord]:
-        start = raw_text.find("{")
-        end = raw_text.rfind("}")
-        if start == -1 or end == -1 or end <= start:
-            raise ValueError("LLM response did not contain a JSON object.")
+        cleaned_text = re.sub(r"<think>.*?</think>", "", raw_text, flags=re.DOTALL | re.IGNORECASE).strip()
+        fenced_match = re.search(r"```(?:json)?\s*(\{.*?\})\s*```", cleaned_text, flags=re.DOTALL | re.IGNORECASE)
+        if fenced_match:
+            candidate = fenced_match.group(1)
+        else:
+            start = cleaned_text.find("{")
+            end = cleaned_text.rfind("}")
+            if start == -1 or end == -1 or end <= start:
+                raise ValueError("LLM response did not contain a JSON object.")
+            candidate = cleaned_text[start : end + 1]
 
-        parsed = json.loads(raw_text[start : end + 1])
+        parsed = json.loads(candidate)
         drone_positions = observation["drone_positions"]
         grid_size = int(observation.get("grid_size", 10))
         targets: Dict[str, Coord] = {}

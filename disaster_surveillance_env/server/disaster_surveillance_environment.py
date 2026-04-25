@@ -292,6 +292,7 @@ class DisasterSurveillanceEnvironment(
             "coordinator_fallback_reason": None,
             "last_llm_latency_ms": None,
             "last_llm_raw_response": None,
+            "last_llm_debug": None,
             "_latencies_by_severity": latency_lists,
         }
         self._mark_initial_cells_visited()
@@ -524,6 +525,7 @@ class DisasterSurveillanceEnvironment(
         self.metrics["coordinator_fallback_reason"] = decision_metadata.get("fallback_reason")
         self.metrics["last_llm_latency_ms"] = decision_metadata.get("llm_latency_ms")
         self.metrics["last_llm_raw_response"] = decision_metadata.get("llm_raw_response")
+        self.metrics["last_llm_debug"] = decision_metadata.get("llm_debug")
         if decision_metadata.get("decision_source") == "heuristic_fallback":
             self.metrics["coordinator_fallback_count"] += 1
         return normalized_targets
@@ -752,8 +754,13 @@ def run_random_episode(
     render: bool = False,
     level: int = 4,
     verbose: bool = True,
+    episode_length: Optional[int] = None,
 ) -> Dict[str, Any]:
-    env = DisasterSurveillanceEnvironment(seed=seed, level=level)
+    env = DisasterSurveillanceEnvironment(
+        seed=seed,
+        level=level,
+        episode_length=episode_length or DisasterSurveillanceEnvironment.EPISODE_LENGTH,
+    )
     observation = env.reset(seed=seed)
     if verbose:
         print("Initial observation:")
@@ -792,6 +799,7 @@ def run_random_episode(
             print(f"  coordinator_decision_source: {public_metrics['coordinator_decision_source']}")
             print(f"  coordinator_fallback_count: {public_metrics['coordinator_fallback_count']}")
             print(f"  coordinator_fallback_reason: {public_metrics['coordinator_fallback_reason']}")
+            print(f"  last_llm_debug: {public_metrics['last_llm_debug']}")
             print(f"  last_assigned_targets: {public_metrics['last_assigned_targets']}")
             print(f"  path_efficiency: {public_metrics['path_efficiency']:.2f}")
             print(f"  coordination_quality: {public_metrics['coordination_quality']:.2f}")
@@ -806,6 +814,7 @@ def run_random_episodes(
     seed: int = 7,
     level: int = 4,
     render: bool = False,
+    episode_length: Optional[int] = None,
 ) -> list[Dict[str, Any]]:
     if episodes < 1:
         raise ValueError(f"episodes must be >= 1; got {episodes}.")
@@ -818,6 +827,7 @@ def run_random_episodes(
             render=render and episodes == 1,
             level=level,
             verbose=episodes == 1,
+            episode_length=episode_length,
         )
         all_metrics.append(metrics)
         if episodes > 1:
@@ -863,6 +873,7 @@ def main() -> None:
         help="Environment level: 3 baseline, 4 shaped coordination, 5 urgency, or 6 coordinator control.",
     )
     parser.add_argument("--episodes", "-k", type=int, default=1, help="Number of episodes to run.")
+    parser.add_argument("--episode-length", type=int, default=None, help="Override episode length for debugging.")
     parser.add_argument("--seed", type=int, default=42, help="Base random seed. Episode i uses seed + i.")
     parser.add_argument("--render", action="store_true", help="Render ASCII grid per step. Only enabled for a single episode.")
     args = parser.parse_args()
@@ -871,6 +882,7 @@ def main() -> None:
         seed=args.seed,
         level=args.level,
         render=args.render,
+        episode_length=args.episode_length,
     )
 
 
