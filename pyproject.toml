@@ -22,6 +22,13 @@ llm = [
     "transformers>=4.45.0",
     "torch>=2.2.0",
 ]
+sft = [
+    "transformers>=4.45.0",
+    "torch>=2.2.0",
+    "peft>=0.12.0",
+    "datasets>=2.20.0",
+    "accelerate>=0.34.0",
+]
 
 [project.scripts]
 server = "disaster_surveillance_env.server.app:main"

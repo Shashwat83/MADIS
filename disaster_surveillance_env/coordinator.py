@@ -1,8 +1,6 @@
 from __future__ import annotations
 
-import json
 import os
-import re
 import time
 from abc import ABC, abstractmethod
 from dataclasses import dataclass
@@ -11,6 +9,8 @@ from typing import Any, Dict, List, Mapping, Optional, Protocol, Sequence, Tuple
 from dotenv import load_dotenv
 
 from .models import Coord, manhattan_distance
+from .sft.parsing import parse_target_json
+from .sft.prompting import TARGET_OUTPUT_MODE, build_coordinator_prompt
 
 load_dotenv()
 
@@ -368,26 +368,9 @@ class LLMCoordinator(CoordinatorAgent):
             return None
 
     def _build_prompt(self, observation: Mapping[str, Any]) -> str:
-        compact_observation = {
-            "timestep": observation["timestep"],
-            "grid_size": observation["grid_size"],
-            "drone_positions": observation["drone_positions"],
-            "visible_active_events": observation.get("visible_active_events", []),
-            "team_frontier_cells": observation.get("team_frontier_cells", [])[:20],
-            "recent_team_coverage_ratio": observation.get("recent_team_coverage_ratio", 0.0),
-            "known_detected_events": observation.get("known_detected_events", [])[-10:],
-        }
-        return (
-            "You are a disaster-response drone coordinator.\n"
-            "Assign one target grid cell to each drone.\n"
-            "Prioritize HIGH severity events, then MEDIUM, then LOW.\n"
-            "Avoid assigning the same target to multiple drones unless necessary.\n"
-            "Do not include reasoning, markdown, code fences, prose, or <think> tags.\n"
-            "Return exactly one valid JSON object and nothing else.\n"
-            "The JSON object must have this shape:\n"
-            '{"drone_1": [x, y], "drone_2": [x, y], "drone_3": [x, y]}\n'
-            "All x and y values must be integers inside the grid.\n"
-            f"Observation:\n{json.dumps(compact_observation, separators=(',', ':'))}\n"
+        return build_coordinator_prompt(
+            observation,
+            output_mode=TARGET_OUTPUT_MODE,
         )
 
     def _parse_targets(
@@ -395,28 +378,8 @@ class LLMCoordinator(CoordinatorAgent):
         raw_text: str,
         observation: Mapping[str, Any],
     ) -> Dict[str, Coord]:
-        cleaned_text = re.sub(r"<think>.*?</think>", "", raw_text, flags=re.DOTALL | re.IGNORECASE).strip()
-        fenced_match = re.search(r"```(?:json)?\s*(\{.*?\})\s*```", cleaned_text, flags=re.DOTALL | re.IGNORECASE)
-        if fenced_match:
-            candidate = fenced_match.group(1)
-        else:
-            start = cleaned_text.find("{")
-            end = cleaned_text.rfind("}")
-            if start == -1 or end == -1 or end <= start:
-                raise ValueError("LLM response did not contain a JSON object.")
-            candidate = cleaned_text[start : end + 1]
-
-        parsed = json.loads(candidate)
-        drone_positions = observation["drone_positions"]
-        grid_size = int(observation.get("grid_size", 10))
-        targets: Dict[str, Coord] = {}
-        for drone_id in drone_positions:
-            if drone_id not in parsed:
-                raise ValueError(f"LLM response missing target for {drone_id}.")
-            value = parsed[drone_id]
-            if not isinstance(value, (list, tuple)) or len(value) != 2:
-                raise ValueError(f"Invalid target format for {drone_id}: {value}.")
-            x = max(0, min(grid_size - 1, int(value[0])))
-            y = max(0, min(grid_size - 1, int(value[1])))
-            targets[drone_id] = (x, y)
-        return targets
+        return parse_target_json(
+            raw_text,
+            drone_ids=list(observation["drone_positions"].keys()),
+            grid_size=int(observation.get("grid_size", 10)),
+        )
