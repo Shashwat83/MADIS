@@ -1,4 +1,15 @@
-# Disaster Surveillance OpenEnv
+---
+title: MADIS OpenEnv
+emoji: 🚁
+colorFrom: blue
+colorTo: red
+sdk: docker
+pinned: false
+---
+
+# MADIS
+#
+ Disaster Surveillance OpenEnv
 
 This repository now follows the standard OpenEnv environment layout instead of keeping
 the implementation in a single file.
