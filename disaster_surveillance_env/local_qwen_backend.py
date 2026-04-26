@@ -18,7 +18,7 @@ class LocalQwenBackend:
         self.device = "cuda" if torch.cuda.is_available() else "cpu"
         print("Using device:", self.device)
 
-        self.tokenizer = AutoTokenizer.from_pretrained(model_name, token=True)
+        self.tokenizer = AutoTokenizer.from_pretrained(model_name)
         if self.tokenizer.pad_token_id is None:
             self.tokenizer.pad_token = self.tokenizer.eos_token
 
@@ -26,8 +26,8 @@ class LocalQwenBackend:
             model_name,
             torch_dtype=torch.float16,
             device_map=None,
-            token=True,
         )
+
         if self.adapter_path:
             try:
                 from peft import PeftModel
