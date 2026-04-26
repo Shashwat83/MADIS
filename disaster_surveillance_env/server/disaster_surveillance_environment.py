@@ -52,6 +52,7 @@ class DisasterSurveillanceEnvironment(
     EVENT_MEMORY_LIMIT = 5
     LATENCY_BONUS_THRESHOLD = 3.0
     COORDINATOR_RECENT_MEMORY = 25
+    COORDINATOR_INTERVAL = 5
 
     def __init__(
         self,
@@ -64,14 +65,18 @@ class DisasterSurveillanceEnvironment(
         level: int = 4,
         seed: Optional[int] = None,
         coordinator: Optional[CoordinatorAgent] = None,
+        coordinator_interval: int = COORDINATOR_INTERVAL,
     ) -> None:
         super().__init__()
         if level not in {3, 4, 5, 6}:
             raise ValueError(f"level must be 3, 4, 5, or 6; got {level}.")
+        if coordinator_interval < 1:
+            raise ValueError(f"coordinator_interval must be >= 1; got {coordinator_interval}.")
 
         self.level = level
         self.grid_size = grid_size
         self.episode_length = episode_length
+        self.coordinator_interval = coordinator_interval
         self.agent_ids = [f"drone_{index + 1}" for index in range(n_drones)]
         self.coordinator = coordinator or (LLMCoordinator() if level == 6 else None)
         self.action_space: Dict[str, Any] = (
@@ -123,6 +128,7 @@ class DisasterSurveillanceEnvironment(
             "coordinator": {
                 "fields": [
                     "timestep",
+                    "coordinator_interval",
                     "drone_positions",
                     "visible_active_events",
                     "known_detected_events",
@@ -283,6 +289,9 @@ class DisasterSurveillanceEnvironment(
             },
             "last_assigned_targets": {},
             "target_assignment_count": 0,
+            "coordinator_call_count": 0,
+            "coordinator_cached_target_reuse_count": 0,
+            "coordinator_replan_interval": self.coordinator_interval,
             "target_progress_sum": 0.0,
             "movement_distance_sum": 0.0,
             "path_efficiency": 0.0,
@@ -416,6 +425,7 @@ class DisasterSurveillanceEnvironment(
         observation = {
             "timestep": self.timestep,
             "grid_size": self.grid_size,
+            "coordinator_interval": self.coordinator_interval,
             "drone_positions": {drone_id: drone.position for drone_id, drone in self.drones.items()},
             "visible_active_events": visible_active_events,
             "known_detected_events": [
@@ -476,9 +486,7 @@ class DisasterSurveillanceEnvironment(
         coordinator_observation: Mapping[str, Any],
     ) -> Dict[str, Coord]:
         if action is None:
-            decision = self.coordinator.decide(coordinator_observation) if hasattr(self.coordinator, "decide") else None
-            targets = decision.targets if decision is not None else self.coordinator.act(coordinator_observation)
-            decision_metadata = decision.metadata if decision is not None else getattr(self.coordinator, "last_metadata", {})
+            targets, decision_metadata = self._get_scheduled_or_cached_targets(coordinator_observation)
         elif isinstance(action, DroneActions):
             if action.targets is not None:
                 targets = normalize_targets(action, self.agent_ids, self.grid_size)
@@ -489,15 +497,11 @@ class DisasterSurveillanceEnvironment(
             elif action.actions is not None:
                 raise ValueError("Level 6 does not accept direct per-drone movement actions.")
             else:
-                decision = self.coordinator.decide(coordinator_observation) if hasattr(self.coordinator, "decide") else None
-                targets = decision.targets if decision is not None else self.coordinator.act(coordinator_observation)
-                decision_metadata = decision.metadata if decision is not None else getattr(self.coordinator, "last_metadata", {})
+                targets, decision_metadata = self._get_scheduled_or_cached_targets(coordinator_observation)
         elif isinstance(action, Mapping):
             sample_value = next(iter(action.values()), None)
             if sample_value is None:
-                decision = self.coordinator.decide(coordinator_observation) if hasattr(self.coordinator, "decide") else None
-                targets = decision.targets if decision is not None else self.coordinator.act(coordinator_observation)
-                decision_metadata = decision.metadata if decision is not None else getattr(self.coordinator, "last_metadata", {})
+                targets, decision_metadata = self._get_scheduled_or_cached_targets(coordinator_observation)
             elif isinstance(sample_value, (tuple, list)):
                 targets = normalize_targets(action, self.agent_ids, self.grid_size)
                 decision_metadata = {
@@ -531,6 +535,30 @@ class DisasterSurveillanceEnvironment(
         if decision_metadata.get("decision_source") == "heuristic_fallback":
             self.metrics["coordinator_fallback_count"] += 1
         return normalized_targets
+
+    def _get_scheduled_or_cached_targets(
+        self,
+        coordinator_observation: Mapping[str, Any],
+    ) -> tuple[Dict[str, Coord], Dict[str, Any]]:
+        should_replan = (
+            not self.last_assigned_targets
+            or self.timestep % self.coordinator_interval == 0
+        )
+        if not should_replan:
+            self.metrics["coordinator_cached_target_reuse_count"] += 1
+            return dict(self.last_assigned_targets), {
+                "decision_source": "cached_targets",
+                "model_name": getattr(self.coordinator, "model_name", None),
+                "coordinator_interval": self.coordinator_interval,
+            }
+
+        self.metrics["coordinator_call_count"] += 1
+        decision = self.coordinator.decide(coordinator_observation) if hasattr(self.coordinator, "decide") else None
+        targets = decision.targets if decision is not None else self.coordinator.act(coordinator_observation)
+        decision_metadata = decision.metadata if decision is not None else getattr(self.coordinator, "last_metadata", {})
+        decision_metadata = dict(decision_metadata)
+        decision_metadata["coordinator_interval"] = self.coordinator_interval
+        return targets, decision_metadata
 
     def _apply_coordinator_targets(self, assigned_targets: Mapping[str, Coord]) -> None:
         for drone_id, target in assigned_targets.items():
@@ -757,11 +785,13 @@ def run_random_episode(
     level: int = 4,
     verbose: bool = True,
     episode_length: Optional[int] = None,
+    coordinator_interval: int = DisasterSurveillanceEnvironment.COORDINATOR_INTERVAL,
 ) -> Dict[str, Any]:
     env = DisasterSurveillanceEnvironment(
         seed=seed,
         level=level,
         episode_length=episode_length or DisasterSurveillanceEnvironment.EPISODE_LENGTH,
+        coordinator_interval=coordinator_interval,
     )
     observation = env.reset(seed=seed)
     if verbose:
@@ -817,6 +847,7 @@ def run_random_episodes(
     level: int = 4,
     render: bool = False,
     episode_length: Optional[int] = None,
+    coordinator_interval: int = DisasterSurveillanceEnvironment.COORDINATOR_INTERVAL,
 ) -> list[Dict[str, Any]]:
     if episodes < 1:
         raise ValueError(f"episodes must be >= 1; got {episodes}.")
@@ -834,6 +865,7 @@ def run_random_episodes(
                 level=level,
                 verbose=episodes == 1,
                 episode_length=episode_length,
+                coordinator_interval=coordinator_interval,
             )
         except Exception as exc:
             elapsed = time.perf_counter() - started_at
@@ -897,6 +929,12 @@ def main() -> None:
     )
     parser.add_argument("--episodes", "-k", type=int, default=1, help="Number of episodes to run.")
     parser.add_argument("--episode-length", type=int, default=None, help="Override episode length for debugging.")
+    parser.add_argument(
+        "--coordinator-interval",
+        type=int,
+        default=DisasterSurveillanceEnvironment.COORDINATOR_INTERVAL,
+        help="Level 6 LLM replanning interval. Use 1 for every timestep; 5 reuses targets between replans.",
+    )
     parser.add_argument("--seed", type=int, default=42, help="Base random seed. Episode i uses seed + i.")
     parser.add_argument("--render", action="store_true", help="Render ASCII grid per step. Only enabled for a single episode.")
     args = parser.parse_args()
@@ -906,6 +944,7 @@ def main() -> None:
         level=args.level,
         render=args.render,
         episode_length=args.episode_length,
+        coordinator_interval=args.coordinator_interval,
     )
 
 

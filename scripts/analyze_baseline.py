@@ -29,10 +29,17 @@ REWARD_BREAKDOWN_KEYS = (
 )
 
 
-def run_analysis_episode(seed: int, level: int = 6, episode_length: int | None = None) -> Dict[str, Any]:
+def run_analysis_episode(
+    seed: int,
+    level: int = 6,
+    episode_length: int | None = None,
+    coordinator_interval: int = 5,
+) -> Dict[str, Any]:
     env_kwargs: Dict[str, Any] = {"seed": seed, "level": level}
     if episode_length is not None:
         env_kwargs["episode_length"] = episode_length
+    if level == 6:
+        env_kwargs["coordinator_interval"] = coordinator_interval
     env = DisasterSurveillanceEnvironment(**env_kwargs)
     observation = env.reset(seed=seed)
 
@@ -55,7 +62,7 @@ def run_analysis_episode(seed: int, level: int = 6, episode_length: int | None =
         else useful_cells / float(total_steps or 1)
     )
 
-    target_assignments = int(metrics.get("target_assignment_count", 0))
+    target_assignments = int(metrics.get("coordinator_call_count") or metrics.get("target_assignment_count", 0))
     fallback_count = int(metrics.get("coordinator_fallback_count", 0))
     metrics["derived_fallback_rate"] = fallback_count / float(target_assignments or 1)
     metrics["model_name"] = metrics.get("coordinator_model_name") or get_configured_model_name()
@@ -63,14 +70,25 @@ def run_analysis_episode(seed: int, level: int = 6, episode_length: int | None =
     return metrics
 
 
-def run_episodes(episodes: int, seed: int, level: int, episode_length: int | None = None) -> List[Dict[str, Any]]:
+def run_episodes(
+    episodes: int,
+    seed: int,
+    level: int,
+    episode_length: int | None = None,
+    coordinator_interval: int = 5,
+) -> List[Dict[str, Any]]:
     results: List[Dict[str, Any]] = []
     started_at = time.perf_counter()
     for index in range(episodes):
         episode = index + 1
         episode_started_at = time.perf_counter()
         try:
-            metrics = run_analysis_episode(seed=seed + index, level=level, episode_length=episode_length)
+            metrics = run_analysis_episode(
+                seed=seed + index,
+                level=level,
+                episode_length=episode_length,
+                coordinator_interval=coordinator_interval,
+            )
         except Exception as exc:
             elapsed = time.perf_counter() - started_at
             print(
@@ -91,7 +109,8 @@ def run_episodes(episodes: int, seed: int, level: int, episode_length: int | Non
             print(
                 "episode={episode}/{episodes} episode_time={episode_time:.1f}s elapsed={elapsed:.1f}s eta={eta:.1f}s "
                 "reward={reward:.1f} coverage={coverage:.1f}% detected={detected} missed={missed} "
-                "high_miss={high_miss:.2f} fallback_rate={fallback:.2f} source={source} fallback_reason={fallback_reason}".format(
+                "high_miss={high_miss:.2f} fallback_rate={fallback:.2f} calls={calls} cached_reuse={cached_reuse} "
+                "source={source} fallback_reason={fallback_reason}".format(
                     episode=episode,
                     episodes=episodes,
                     episode_time=episode_time,
@@ -105,6 +124,8 @@ def run_episodes(episodes: int, seed: int, level: int, episode_length: int | Non
                     missed=metrics["events_missed"],
                     high_miss=metrics["high_priority_miss_rate"],
                     fallback=metrics["derived_fallback_rate"],
+                    calls=metrics.get("coordinator_call_count", 0),
+                    cached_reuse=metrics.get("coordinator_cached_target_reuse_count", 0),
                 )
             )
     return results
@@ -375,6 +396,9 @@ def build_cache_rows(metrics: Sequence[Mapping[str, Any]]) -> Dict[str, List[Dic
                 "coordinator_decision_source": source,
                 "decision_source_code": source_codes.get(source, -1),
                 "coordinator_fallback_count": item.get("coordinator_fallback_count", 0),
+                "coordinator_call_count": item.get("coordinator_call_count", 0),
+                "coordinator_cached_target_reuse_count": item.get("coordinator_cached_target_reuse_count", 0),
+                "coordinator_replan_interval": item.get("coordinator_replan_interval", 1),
                 "target_assignment_count": item.get("target_assignment_count", 0),
                 "fallback_rate": item["derived_fallback_rate"],
                 "last_llm_diagnosis": (item.get("last_llm_debug") or {}).get("diagnosis"),
@@ -397,6 +421,9 @@ def build_cache_rows(metrics: Sequence[Mapping[str, Any]]) -> Dict[str, List[Dic
                 "fallback_rate": item["derived_fallback_rate"],
                 "coordinator_decision_source": source,
                 "coordinator_fallback_count": item.get("coordinator_fallback_count", 0),
+                "coordinator_call_count": item.get("coordinator_call_count", 0),
+                "coordinator_cached_target_reuse_count": item.get("coordinator_cached_target_reuse_count", 0),
+                "coordinator_replan_interval": item.get("coordinator_replan_interval", 1),
                 "target_assignment_count": item.get("target_assignment_count", 0),
                 "last_llm_diagnosis": (item.get("last_llm_debug") or {}).get("diagnosis"),
             }
@@ -442,6 +469,9 @@ def save_outputs(metrics: Sequence[Mapping[str, Any]], output_dir: Path) -> None
             "coordinator_decision_source",
             "decision_source_code",
             "coordinator_fallback_count",
+            "coordinator_call_count",
+            "coordinator_cached_target_reuse_count",
+            "coordinator_replan_interval",
             "target_assignment_count",
             "fallback_rate",
             "last_llm_diagnosis",
@@ -466,6 +496,9 @@ def save_outputs(metrics: Sequence[Mapping[str, Any]], output_dir: Path) -> None
             "fallback_rate",
             "coordinator_decision_source",
             "coordinator_fallback_count",
+            "coordinator_call_count",
+            "coordinator_cached_target_reuse_count",
+            "coordinator_replan_interval",
             "target_assignment_count",
             "last_llm_diagnosis",
         ],
@@ -541,6 +574,12 @@ def main() -> None:
     parser.add_argument("--level", type=int, default=6, choices=[3, 4, 5, 6], help="Environment level to evaluate.")
     parser.add_argument("--episode-length", type=int, default=None, help="Optional shorter episode length for debugging.")
     parser.add_argument(
+        "--coordinator-interval",
+        type=int,
+        default=5,
+        help="Level 6 LLM replanning interval. Use 1 for every timestep; 5 is faster target reuse.",
+    )
+    parser.add_argument(
         "--output-dir",
         type=Path,
         default=None,
@@ -559,6 +598,7 @@ def main() -> None:
         seed=args.seed,
         level=args.level,
         episode_length=args.episode_length,
+        coordinator_interval=args.coordinator_interval,
     )
     save_outputs(metrics, output_dir)
     print(f"\nSaved CSV caches to: {output_dir / 'csv'}")
