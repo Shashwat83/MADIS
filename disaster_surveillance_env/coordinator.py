@@ -308,6 +308,7 @@ class LLMCoordinator(CoordinatorAgent):
         self.model_name = get_configured_model_name(model_name)
         self.fallback = fallback or HeuristicCoordinator()
         self.backend = backend
+        self._backend_build_attempted = False
         self.last_metadata: Dict[str, Any] = {}
         self._backend_error: Optional[str] = None
 
@@ -416,8 +417,14 @@ class LLMCoordinator(CoordinatorAgent):
     def _ensure_backend(self) -> Optional[TextGenerationBackend]:
         if self.backend is not None:
             return self.backend
+    
+        if self._backend_build_attempted:
+            return None
+    
+        self._backend_build_attempted = True
         self.backend = self._build_default_backend(self.model_name)
         return self.backend
+
 
     def _build_default_backend(self, model_name: str) -> Optional[TextGenerationBackend]:
         try:
