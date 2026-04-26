@@ -434,7 +434,9 @@ class LLMCoordinator(CoordinatorAgent):
             self._backend_error = f"{type(exc).__name__}: {exc}"
             return None
 
-
+    def _build_prompt(self, observation: Mapping[str, Any]) -> str:
+        return build_coordinator_prompt(observation)
+    
     def _parse_targets(
         self,
         raw_text: str,
