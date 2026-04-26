@@ -16,3 +16,9 @@ outputs/matplotlib_cache/
 outputs/sft/*/adapter/
 outputs/sft/*/checkpoints/
 outputs/sft/*/tokenizer/
+
+outputs/sft/*.zip
+outputs/sft/*/adapter/
+outputs/sft/*/tokenizer/
+outputs/sft/*/checkpoints/
+outputs/sft/*/merged_model/

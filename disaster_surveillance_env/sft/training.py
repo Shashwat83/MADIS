@@ -59,6 +59,16 @@ def count_valid_records(path: Path) -> int:
     return count
 
 
+def read_first_record_metadata(path: Path) -> Dict[str, Any]:
+    for record in iter_jsonl_records(path):
+        validate_sft_record(record)
+        metadata = record.get("metadata")
+        if isinstance(metadata, Mapping):
+            return dict(metadata)
+        break
+    return {}
+
+
 def file_sha256(path: Path) -> str:
     digest = hashlib.sha256()
     with path.open("rb") as handle:
@@ -141,6 +151,93 @@ def save_json(path: Path, payload: Mapping[str, Any]) -> None:
     path.write_text(json.dumps(payload, indent=2, sort_keys=True) + "\n", encoding="utf-8")
 
 
+def build_sft_results(
+    *,
+    run_name: str,
+    run_paths: RunPaths,
+    manifest: Mapping[str, Any],
+    trainer_state: Any,
+    train_jsonl: Path,
+    eval_jsonl: Optional[Path],
+    merged_model_dir: Optional[Path] = None,
+) -> Dict[str, Any]:
+    train_metadata = read_first_record_metadata(train_jsonl)
+    dataset_summary: Dict[str, Any] = {
+        "train_records": manifest["dataset_manifest"]["train_records"],
+        "eval_records": manifest["dataset_manifest"].get("eval_records", 0),
+        "train_jsonl_origin": str(train_jsonl.resolve()),
+        "eval_jsonl_origin": str(eval_jsonl.resolve()) if eval_jsonl is not None else None,
+        "dataset_type": train_metadata.get("dataset_type"),
+    }
+    if train_metadata.get("visibility_mode") is not None:
+        dataset_summary["visibility_mode"] = train_metadata["visibility_mode"]
+
+    log_history = list(getattr(trainer_state, "log_history", []) or [])
+    train_loss_logs = [
+        {
+            "step": row.get("step"),
+            "epoch": row.get("epoch"),
+            "loss": row.get("loss"),
+            "grad_norm": row.get("grad_norm"),
+            "learning_rate": row.get("learning_rate"),
+        }
+        for row in log_history
+        if "loss" in row
+    ]
+    eval_logs = [
+        {
+            "step": row.get("step"),
+            "epoch": row.get("epoch"),
+            "eval_loss": row.get("eval_loss"),
+        }
+        for row in log_history
+        if "eval_loss" in row
+    ]
+
+    last_checkpoint = None
+    global_step = int(getattr(trainer_state, "global_step", 0) or 0)
+    checkpoint_dir = run_paths.checkpoints_dir / f"checkpoint-{global_step}"
+    if global_step > 0 and checkpoint_dir.exists():
+        last_checkpoint = str(checkpoint_dir.resolve())
+
+    artifacts: Dict[str, Any] = {
+        "adapter_path": str(run_paths.adapter_dir.resolve()),
+        "tokenizer_path": str(run_paths.tokenizer_dir.resolve()),
+        "checkpoint_path": last_checkpoint,
+        "run_manifest_path": str((run_paths.metadata_dir / "run_manifest.json").resolve()),
+        "grpo_reuse_path": str((run_paths.metadata_dir / "grpo_reuse.json").resolve()),
+    }
+    if merged_model_dir is not None and merged_model_dir.exists():
+        artifacts["merged_model_path"] = str(merged_model_dir.resolve())
+
+    return {
+        "run_name": run_name,
+        "artifact_root": str(run_paths.root.resolve()),
+        "base_model_name": manifest["base_model_name"],
+        "training_stage": "sft",
+        "status": "completed",
+        "output_mode": manifest["output_mode"],
+        "dataset_summary": dataset_summary,
+        "hyperparameters": dict(manifest["training_args"]),
+        "training_results": {
+            "global_step": global_step,
+            "train_batch_size": manifest["training_args"].get("per_device_train_batch_size"),
+            "final_train_loss": getattr(trainer_state, "train_loss", None),
+            "logged_train_losses": train_loss_logs,
+            "logged_eval_losses": eval_logs,
+            "eval_ran_during_training": bool(eval_logs),
+            "best_metric": getattr(trainer_state, "best_metric", None),
+            "best_model_checkpoint": getattr(trainer_state, "best_model_checkpoint", None),
+            "train_runtime_seconds": getattr(trainer_state, "train_runtime", None),
+            "train_samples_per_second": getattr(trainer_state, "train_samples_per_second", None),
+            "train_steps_per_second": getattr(trainer_state, "train_steps_per_second", None),
+            "total_flos": getattr(trainer_state, "total_flos", None),
+        },
+        "artifacts": artifacts,
+        "notes": [],
+    }
+
+
 def truncate_prompt_completion(
     prompt_ids: Sequence[int],
     response_ids: Sequence[int],
@@ -173,4 +270,3 @@ def truncate_prompt_completion(
         "prompt_tokens": len(trimmed_prompt),
         "response_tokens": len(response_tail),
     }
-

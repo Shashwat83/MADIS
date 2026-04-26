@@ -20,8 +20,11 @@ def run_adapter_eval(
     level: int = 6,
     episode_length: Optional[int] = None,
 ) -> List[Dict[str, Any]]:
-    del tokenizer_path  # tokenizer path is kept for artifact completeness; backend loads from base model for now.
-    backend = LocalPeftCoordinatorBackend(base_model_name=base_model_name, adapter_path=adapter_path)
+    backend = LocalPeftCoordinatorBackend(
+        base_model_name=base_model_name,
+        adapter_path=adapter_path,
+        tokenizer_path=tokenizer_path,
+    )
     coordinator = LLMCoordinator(backend=backend, model_name=base_model_name)
     results: List[Dict[str, Any]] = []
 

@@ -11,8 +11,10 @@ if str(ROOT) not in sys.path:
     sys.path.insert(0, str(ROOT))
 
 from disaster_surveillance_env.coordinator import get_configured_model_name
+from disaster_surveillance_env.hf_hub_auth import from_pretrained_token_kwargs
 from disaster_surveillance_env.sft.training import (
     DEFAULT_LORA_TARGET_MODULES,
+    build_sft_results,
     build_run_manifest,
     count_valid_records,
     ensure_run_paths,
@@ -86,6 +88,9 @@ def _save_run_artifacts(
     tokenizer: Any,
     trainer: Any,
     manifest: dict[str, Any],
+    train_jsonl: Path,
+    eval_jsonl: Optional[Path],
+    export_merged_model: bool,
 ) -> None:
     trainer.save_model(str(paths.adapter_dir))
     tokenizer.save_pretrained(str(paths.tokenizer_dir))
@@ -99,6 +104,24 @@ def _save_run_artifacts(
         },
     )
     save_json(paths.metadata_dir / "trainer_state_summary.json", trainer.state.log_history[-20:] if trainer.state.log_history else {"log_history": []})
+    merged_model_dir: Optional[Path] = None
+    if export_merged_model:
+        merged_model_dir = paths.root / "merged_model"
+        merged_model_dir.mkdir(parents=True, exist_ok=True)
+        merged_model = trainer.model.merge_and_unload()
+        merged_model.save_pretrained(str(merged_model_dir))
+        tokenizer.save_pretrained(str(merged_model_dir))
+
+    sft_results = build_sft_results(
+        run_name=paths.root.name,
+        run_paths=paths,
+        manifest=manifest,
+        trainer_state=trainer.state,
+        train_jsonl=train_jsonl,
+        eval_jsonl=eval_jsonl,
+        merged_model_dir=merged_model_dir,
+    )
+    save_json(paths.metadata_dir / "sft_results.json", sft_results)
 
 
 def run_training(args: argparse.Namespace) -> None:
@@ -168,7 +191,11 @@ def run_training(args: argparse.Namespace) -> None:
         else None
     )
 
-    tokenizer = AutoTokenizer.from_pretrained(args.model_name, trust_remote_code=args.trust_remote_code)
+    tokenizer = AutoTokenizer.from_pretrained(
+        args.model_name,
+        trust_remote_code=args.trust_remote_code,
+        **from_pretrained_token_kwargs(),
+    )
     if tokenizer.pad_token is None:
         tokenizer.pad_token = tokenizer.eos_token
     tokenizer.padding_side = "right"
@@ -186,12 +213,18 @@ def run_training(args: argparse.Namespace) -> None:
     model_kwargs: dict[str, Any] = {
         "trust_remote_code": args.trust_remote_code,
     }
+    model_kwargs.update(from_pretrained_token_kwargs())
     if quantization_config is not None:
         model_kwargs["quantization_config"] = quantization_config
     else:
-        model_kwargs["torch_dtype"] = torch_dtype
+        model_kwargs["dtype"] = torch_dtype
 
-    model = AutoModelForCausalLM.from_pretrained(args.model_name, **model_kwargs)
+    try:
+        model = AutoModelForCausalLM.from_pretrained(args.model_name, **model_kwargs)
+    except TypeError:
+        model_kwargs.pop("dtype", None)
+        model_kwargs["torch_dtype"] = torch_dtype
+        model = AutoModelForCausalLM.from_pretrained(args.model_name, **model_kwargs)
     if args.use_4bit:
         model = prepare_model_for_kbit_training(model)
     if args.gradient_checkpointing:
@@ -260,10 +293,20 @@ def run_training(args: argparse.Namespace) -> None:
         processing_class=tokenizer,
     )
     trainer.train(resume_from_checkpoint=args.resume_from_checkpoint)
-    _save_run_artifacts(paths=run_paths, tokenizer=tokenizer, trainer=trainer, manifest=manifest)
+    _save_run_artifacts(
+        paths=run_paths,
+        tokenizer=tokenizer,
+        trainer=trainer,
+        manifest=manifest,
+        train_jsonl=args.train_jsonl,
+        eval_jsonl=args.eval_jsonl,
+        export_merged_model=args.export_merged_model,
+    )
     print(f"Saved adapter to {run_paths.adapter_dir}")
     print(f"Saved tokenizer to {run_paths.tokenizer_dir}")
     print(f"Saved run metadata to {run_paths.metadata_dir}")
+    if args.export_merged_model:
+        print(f"Saved merged model to {run_paths.root / 'merged_model'}")
 
 
 def main() -> None:
@@ -304,6 +347,7 @@ def main() -> None:
     parser.add_argument("--trust-remote-code", action="store_true")
     parser.add_argument("--resume-from-checkpoint", type=str, default=None)
     parser.add_argument("--load-best-model-at-end", action="store_true")
+    parser.add_argument("--export-merged-model", action="store_true")
     parser.add_argument("--dry-run", action="store_true", help="Validate dataset shape without launching training.")
     args = parser.parse_args()
     run_training(args)

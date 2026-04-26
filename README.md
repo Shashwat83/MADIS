@@ -52,6 +52,38 @@ python3 scripts/run_random_episode.py --level 6 --episodes 1
 
 Level 6 uses the coordinator model `Qwen/Qwen3-1.7B` by default through Hugging Face inference when available. If inference is unavailable locally, the env falls back to the heuristic coordinator and logs that fallback in metrics.
 
+## Hugging Face authentication (Colab + local)
+
+Many training and inference paths download models from the Hugging Face Hub. For best performance, set `HF_TOKEN` (or `HUGGING_FACE_HUB_TOKEN`) so requests are authenticated and not rate-limited.
+
+### Colab
+
+Add a secret named `HF_TOKEN` in the Colab UI (Settings → Secrets), then run:
+
+```python
+import os
+
+try:
+    from google.colab import userdata  # type: ignore
+    os.environ["HF_TOKEN"] = userdata.get("HF_TOKEN")
+except Exception:
+    pass
+```
+
+If you see messages about vault timeouts, it usually means the secret is not available to the runtime from the Colab UI.
+
+### GPU dtype tip (T4)
+
+On T4-class GPUs, prefer `--fp16` (and optionally `--use-4bit`) for SFT/GRPO training. `--bf16` often provides no benefit on T4.
+
+### GRPO can look “stuck”
+
+`scripts/train_grpo_coordinator.py` runs periodic evaluations that execute full environment rollouts. For quick iterations, keep `--config-preset pilot` and reduce evaluation frequency/size with:
+
+- `--small-eval-every-episodes`, `--small-eval-episodes`
+- `--medium-eval-every-episodes`, `--medium-eval-episodes`
+- `--full-eval-every-episodes`, `--full-eval-episodes`
+
 Run the Level 3 baseline:
 
 ```bash

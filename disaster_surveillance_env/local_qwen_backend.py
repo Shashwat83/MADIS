@@ -18,7 +18,6 @@ class LocalQwenBackend:
         outputs = self.model.generate(
             **inputs,
             max_new_tokens=220,
-            temperature=0.0,
             do_sample=False,
         )
 

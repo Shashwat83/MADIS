@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import argparse
 import csv
+import inspect
 import json
 from pathlib import Path
 import sys
@@ -16,6 +17,7 @@ from disaster_surveillance_env.grpo.dataset import export_grpo_prompt_jsonl, ite
 from disaster_surveillance_env.grpo.eval import run_adapter_eval, run_backend_eval
 from disaster_surveillance_env.grpo.local_peft_backend import LoadedPeftCoordinatorBackend
 from disaster_surveillance_env.grpo.rewards import environment_step_reward, json_valid_reward, unique_target_reward
+from disaster_surveillance_env.hf_hub_auth import from_pretrained_token_kwargs
 from disaster_surveillance_env.sft.training import save_json
 from scripts.analyze_baseline import save_line_plot
 
@@ -101,6 +103,12 @@ def _append_csv_row(path: Path, fieldnames: List[str], row: Dict[str, Any]) -> N
         writer.writerow({name: row.get(name) for name in fieldnames})
 
 
+def _filter_supported_kwargs(callable_obj: Any, kwargs: Dict[str, Any]) -> Dict[str, Any]:
+    """Keep only kwargs supported by the installed runtime signature."""
+    supported = inspect.signature(callable_obj).parameters
+    return {key: value for key, value in kwargs.items() if key in supported}
+
+
 def _save_training_plots(csv_path: Path, output_dir: Path) -> None:
     if not csv_path.exists():
         return
@@ -134,6 +142,15 @@ def _save_training_plots(csv_path: Path, output_dir: Path) -> None:
             "Tokens",
             smooth=False,
         )
+
+
+def _consume_eval_trigger(episodes_seen: int, next_trigger: int, every: int) -> tuple[Optional[int], int]:
+    if every <= 0 or episodes_seen < next_trigger:
+        return None, next_trigger
+    triggered = next_trigger
+    while episodes_seen >= next_trigger:
+        next_trigger += every
+    return triggered, next_trigger
 
 
 def _summarize_eval(metrics: List[Dict[str, Any]]) -> Dict[str, Any]:
@@ -213,33 +230,33 @@ def _make_callback(
                 self.next_log_episode += log_every_episodes
 
             backend = LoadedPeftCoordinatorBackend(model=model, tokenizer=processing_class or tokenizer, torch_module=torch_module)
-            while episodes_seen >= self.next_small_eval:
+            triggered, self.next_small_eval = _consume_eval_trigger(episodes_seen, self.next_small_eval, small_eval_every_episodes)
+            if triggered is not None:
                 self._run_eval(
                     eval_type="small",
                     eval_episodes=small_eval_episodes,
-                    trigger_episodes=self.next_small_eval,
+                    trigger_episodes=triggered,
                     backend=backend,
                     step=step,
                 )
-                self.next_small_eval += small_eval_every_episodes
-            while episodes_seen >= self.next_medium_eval:
+            triggered, self.next_medium_eval = _consume_eval_trigger(episodes_seen, self.next_medium_eval, medium_eval_every_episodes)
+            if triggered is not None:
                 self._run_eval(
                     eval_type="medium",
                     eval_episodes=medium_eval_episodes,
-                    trigger_episodes=self.next_medium_eval,
+                    trigger_episodes=triggered,
                     backend=backend,
                     step=step,
                 )
-                self.next_medium_eval += medium_eval_every_episodes
-            while episodes_seen >= self.next_full_eval:
+            triggered, self.next_full_eval = _consume_eval_trigger(episodes_seen, self.next_full_eval, full_eval_every_episodes)
+            if triggered is not None:
                 self._run_eval(
                     eval_type="full",
                     eval_episodes=full_eval_episodes,
-                    trigger_episodes=self.next_full_eval,
+                    trigger_episodes=triggered,
                     backend=backend,
                     step=step,
                 )
-                self.next_full_eval += full_eval_every_episodes
 
         def _run_eval(self, *, eval_type: str, eval_episodes: int, trigger_episodes: int, backend: object, step: int) -> None:
             output_dir = eval_output_dir / f"{eval_type}_eval_ep{trigger_episodes:04d}"
@@ -274,7 +291,14 @@ def _make_callback(
 
 def _load_sft_artifact_info(sft_run_dir: Path) -> Dict[str, Any]:
     grpo_reuse = json.loads((sft_run_dir / "metadata" / "grpo_reuse.json").read_text(encoding="utf-8"))
-    sft_results = json.loads((sft_run_dir / "metadata" / "sft_results.json").read_text(encoding="utf-8"))
+    sft_results_path = sft_run_dir / "metadata" / "sft_results.json"
+    if sft_results_path.exists():
+        sft_results = json.loads(sft_results_path.read_text(encoding="utf-8"))
+    else:
+        sft_results = {
+            "status": "missing",
+            "warning": "metadata/sft_results.json was not found. GRPO can continue using grpo_reuse metadata only.",
+        }
     return {"grpo_reuse": grpo_reuse, "sft_results": sft_results}
 
 
@@ -386,11 +410,16 @@ def main() -> None:
     GRPOConfig = stack["GRPOConfig"]
     GRPOTrainer = stack["GRPOTrainer"]
 
-    tokenizer = AutoTokenizer.from_pretrained(tokenizer_path, trust_remote_code=args.trust_remote_code)
+    tokenizer = AutoTokenizer.from_pretrained(
+        tokenizer_path,
+        trust_remote_code=args.trust_remote_code,
+        **from_pretrained_token_kwargs(),
+    )
     if tokenizer.pad_token is None:
         tokenizer.pad_token = tokenizer.eos_token
 
     model_kwargs: Dict[str, Any] = {"trust_remote_code": args.trust_remote_code}
+    model_kwargs.update(from_pretrained_token_kwargs())
     if args.use_4bit:
         compute_dtype = torch.bfloat16 if args.bf16 else (torch.float16 if args.fp16 else torch.float32)
         model_kwargs["quantization_config"] = BitsAndBytesConfig(
@@ -400,9 +429,15 @@ def main() -> None:
             bnb_4bit_compute_dtype=compute_dtype,
         )
     else:
-        model_kwargs["torch_dtype"] = torch.bfloat16 if args.bf16 else (torch.float16 if args.fp16 else torch.float32)
+        model_kwargs["dtype"] = torch.bfloat16 if args.bf16 else (torch.float16 if args.fp16 else torch.float32)
 
-    base_model = AutoModelForCausalLM.from_pretrained(base_model_name, **model_kwargs)
+    try:
+        base_model = AutoModelForCausalLM.from_pretrained(base_model_name, **model_kwargs)
+    except TypeError:
+        dtype = model_kwargs.pop("dtype", None)
+        if dtype is not None:
+            model_kwargs["torch_dtype"] = dtype
+        base_model = AutoModelForCausalLM.from_pretrained(base_model_name, **model_kwargs)
     model = PeftModel.from_pretrained(base_model, adapter_path, is_trainable=True)
     if args.gradient_checkpointing:
         model.gradient_checkpointing_enable()
@@ -430,34 +465,44 @@ def main() -> None:
         trainer_callback_base=TrainerCallback,
     )
 
-    grpo_args = GRPOConfig(
-        output_dir=str(args.output_dir / "checkpoints"),
-        learning_rate=args.learning_rate,
-        beta=args.beta,
-        epsilon=args.epsilon,
-        num_generations=group_size,
-        per_device_train_batch_size=prompts_per_update,
-        max_prompt_length=args.max_prompt_length,
-        max_completion_length=args.max_completion_length,
-        logging_steps=1,
-        save_steps=args.save_steps,
-        max_steps=max_steps,
-        bf16=args.bf16,
-        fp16=args.fp16,
-        gradient_checkpointing=args.gradient_checkpointing,
-        report_to=[],
-        seed=args.seed,
-        log_completions=True,
-        use_vllm=args.use_vllm,
+    grpo_config_kwargs = _filter_supported_kwargs(
+        GRPOConfig.__init__,
+        {
+            "output_dir": str(args.output_dir / "checkpoints"),
+            "learning_rate": args.learning_rate,
+            "beta": args.beta,
+            "epsilon": args.epsilon,
+            "num_generations": group_size,
+            "per_device_train_batch_size": prompts_per_update,
+            "max_prompt_length": args.max_prompt_length,
+            "max_completion_length": args.max_completion_length,
+            "logging_steps": 1,
+            "save_steps": args.save_steps,
+            "max_steps": max_steps,
+            "bf16": args.bf16,
+            "fp16": args.fp16,
+            "gradient_checkpointing": args.gradient_checkpointing,
+            "report_to": [],
+            "seed": args.seed,
+            "log_completions": True,
+            "use_vllm": args.use_vllm,
+        },
     )
-    trainer = GRPOTrainer(
-        model=model,
-        processing_class=tokenizer,
-        reward_funcs=[json_valid_reward, unique_target_reward, environment_step_reward],
-        train_dataset=train_dataset,
-        args=grpo_args,
-        callbacks=[callback_cls()],
+    grpo_args = GRPOConfig(**grpo_config_kwargs)
+
+    trainer_kwargs = _filter_supported_kwargs(
+        GRPOTrainer.__init__,
+        {
+            "model": model,
+            "processing_class": tokenizer,
+            "tokenizer": tokenizer,
+            "reward_funcs": [json_valid_reward, unique_target_reward, environment_step_reward],
+            "train_dataset": train_dataset,
+            "args": grpo_args,
+            "callbacks": [callback_cls()],
+        },
     )
+    trainer = GRPOTrainer(**trainer_kwargs)
     trainer.train()
     trainer.save_model(str(args.output_dir / "adapter"))
     tokenizer.save_pretrained(str(args.output_dir / "tokenizer"))

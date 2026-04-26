@@ -2,6 +2,8 @@ from __future__ import annotations
 
 from typing import Optional
 
+from ..hf_hub_auth import from_pretrained_token_kwargs
+
 
 class LocalPeftCoordinatorBackend:
     def __init__(
@@ -9,6 +11,7 @@ class LocalPeftCoordinatorBackend:
         *,
         base_model_name: str,
         adapter_path: str,
+        tokenizer_path: Optional[str] = None,
         max_new_tokens: int = 220,
         trust_remote_code: bool = False,
     ) -> None:
@@ -24,15 +27,24 @@ class LocalPeftCoordinatorBackend:
 
         self.torch = torch
         self.max_new_tokens = max_new_tokens
-        self.tokenizer = AutoTokenizer.from_pretrained(base_model_name, trust_remote_code=trust_remote_code)
+        tokenizer_source = tokenizer_path or base_model_name
+        self.tokenizer = AutoTokenizer.from_pretrained(
+            tokenizer_source,
+            trust_remote_code=trust_remote_code,
+            **from_pretrained_token_kwargs(),
+        )
         if self.tokenizer.pad_token is None:
             self.tokenizer.pad_token = self.tokenizer.eos_token
-        base_model = AutoModelForCausalLM.from_pretrained(
-            base_model_name,
-            torch_dtype=torch.bfloat16 if torch.cuda.is_available() else torch.float32,
-            device_map="auto",
-            trust_remote_code=trust_remote_code,
-        )
+        dtype = torch.bfloat16 if torch.cuda.is_available() else torch.float32
+        model_kwargs = {
+            "device_map": "auto",
+            "trust_remote_code": trust_remote_code,
+            **from_pretrained_token_kwargs(),
+        }
+        try:
+            base_model = AutoModelForCausalLM.from_pretrained(base_model_name, dtype=dtype, **model_kwargs)
+        except TypeError:
+            base_model = AutoModelForCausalLM.from_pretrained(base_model_name, torch_dtype=dtype, **model_kwargs)
         self.model = PeftModel.from_pretrained(base_model, adapter_path)
         self.model.eval()
 
@@ -42,7 +54,6 @@ class LocalPeftCoordinatorBackend:
             outputs = self.model.generate(
                 **inputs,
                 max_new_tokens=self.max_new_tokens,
-                temperature=0.0,
                 do_sample=False,
                 pad_token_id=self.tokenizer.pad_token_id,
             )
@@ -63,7 +74,6 @@ class LoadedPeftCoordinatorBackend:
             outputs = self.model.generate(
                 **inputs,
                 max_new_tokens=self.max_new_tokens,
-                temperature=0.0,
                 do_sample=False,
                 pad_token_id=self.tokenizer.pad_token_id,
             )
