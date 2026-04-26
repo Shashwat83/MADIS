@@ -201,7 +201,7 @@ def load_qwen_for_training(model_name: str, imports: Mapping[str, Any]) -> tuple
         raise RuntimeError("CUDA is required for efficient GRPO training. Select a Colab GPU runtime first.")
     print(f"Using GPU: {torch.cuda.get_device_name(0)}", flush=True)
 
-    tokenizer = imports["AutoTokenizer"].from_pretrained(model_name, token=True, trust_remote_code=True)
+    tokenizer = imports["AutoTokenizer"].from_pretrained(model_name, trust_remote_code=True)
     if tokenizer.pad_token_id is None:
         tokenizer.pad_token = tokenizer.eos_token
 
@@ -216,8 +216,7 @@ def load_qwen_for_training(model_name: str, imports: Mapping[str, Any]) -> tuple
         quantization_config=bnb_config,
         device_map="auto",
         torch_dtype=torch.float16,
-        trust_remote_code=True,
-        token=True,
+        trust_remote_code=True
     )
     model = imports["prepare_model_for_kbit_training"](model)
     lora_config = imports["LoraConfig"](
