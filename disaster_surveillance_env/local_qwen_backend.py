@@ -11,7 +11,7 @@ class LocalQwenBackend:
 
     def __init__(
         self,
-        model_name: str = "deepseek-ai/DeepSeek-R1-Distill-Qwen-1.5B",
+        model_name: str = "Qwen/Qwen2.5-1.5B-Instruct",
         adapter_path: str | None = None,
     ) -> None:
         self.model_name = model_name
@@ -28,9 +28,10 @@ class LocalQwenBackend:
 
         self.model = AutoModelForCausalLM.from_pretrained(
             model_name,
-            torch_dtype=torch.float16,
-            device_map=None,
+            torch_dtype="auto",
+            device_map="auto",
         )
+
 
         if self.adapter_path:
             try:
@@ -43,7 +44,7 @@ class LocalQwenBackend:
 
             print("Loading LoRA adapter:", self.adapter_path)
             self.model = PeftModel.from_pretrained(self.model, self.adapter_path)
-        self.model.to(self.device)
+    #    self.model.to(self.device)
         self.model.eval()
 
     def generate(self, prompt: str) -> str:
