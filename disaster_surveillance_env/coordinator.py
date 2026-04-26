@@ -294,9 +294,8 @@ class HFRouterOpenAIBackend:
             "response_keys": sorted(response_payload.keys()),
             "message_keys": sorted(message_payload.keys()),
         }
-        if content is None:
-            return GenerationResult(text="", metadata=metadata)
         return GenerationResult(text=text, metadata=metadata)
+
 
 
 class LLMCoordinator(CoordinatorAgent):
