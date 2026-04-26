@@ -1,11 +1,13 @@
 from __future__ import annotations
 
 import argparse
+import csv
 import json
 from pathlib import Path
 import sys
 import inspect
 import time
+from html import escape
 from typing import Any, Dict, List, Mapping, Sequence
 
 
@@ -98,6 +100,151 @@ def coordinator_targets_to_json(targets: Mapping[str, Sequence[int]]) -> str:
     return json.dumps(
         {drone_id: [int(coord[0]), int(coord[1])] for drone_id, coord in targets.items()},
         separators=(",", ":"),
+    )
+
+
+def _is_number(value: Any) -> bool:
+    return isinstance(value, (int, float)) and not isinstance(value, bool)
+
+
+def _write_csv(path: Path, rows: Sequence[Mapping[str, Any]], fieldnames: Sequence[str]) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    with path.open("w", newline="") as handle:
+        writer = csv.DictWriter(handle, fieldnames=fieldnames)
+        writer.writeheader()
+        for row in rows:
+            writer.writerow({field: row.get(field) for field in fieldnames})
+
+
+def _nice_bounds(values: Sequence[float]) -> tuple[float, float]:
+    if not values:
+        return 0.0, 1.0
+    low = min(values)
+    high = max(values)
+    if low == high:
+        padding = abs(low) * 0.1 or 1.0
+        return low - padding, high + padding
+    padding = (high - low) * 0.08
+    return low - padding, high + padding
+
+
+def _save_metric_plot(path: Path, rows: Sequence[Mapping[str, Any]], metric: str, title: str) -> None:
+    points = [
+        (int(row["step"]), float(row[metric]))
+        for row in rows
+        if row.get("step") is not None and _is_number(row.get(metric))
+    ]
+    if not points:
+        return
+
+    width, height = 900, 460
+    left, right, top, bottom = 72, 28, 54, 64
+    plot_w = width - left - right
+    plot_h = height - top - bottom
+    x_values = [point[0] for point in points]
+    y_values = [point[1] for point in points]
+    x_min, x_max = min(x_values), max(x_values)
+    y_min, y_max = _nice_bounds(y_values)
+    x_span = max(1, x_max - x_min)
+    y_span = max(1e-9, y_max - y_min)
+
+    def sx(step: float) -> float:
+        return left + ((step - x_min) / x_span) * plot_w
+
+    def sy(value: float) -> float:
+        return top + (1.0 - ((value - y_min) / y_span)) * plot_h
+
+    polyline = " ".join(f"{sx(step):.2f},{sy(value):.2f}" for step, value in points)
+    elements = [
+        f'<svg xmlns="http://www.w3.org/2000/svg" width="{width}" height="{height}" viewBox="0 0 {width} {height}">',
+        '<rect width="100%" height="100%" fill="white" />',
+        f'<text x="{width / 2:.2f}" y="28" font-family="Arial, sans-serif" font-size="20" '
+        f'font-weight="700" text-anchor="middle" fill="#111827">{escape(title)}</text>',
+        f'<rect x="{left}" y="{top}" width="{plot_w}" height="{plot_h}" fill="#f9fafb" stroke="#d1d5db" />',
+    ]
+    for tick in range(6):
+        ratio = tick / 5
+        y = top + ratio * plot_h
+        value = y_max - ratio * y_span
+        elements.append(f'<line x1="{left}" y1="{y:.2f}" x2="{left + plot_w}" y2="{y:.2f}" stroke="#e5e7eb" />')
+        elements.append(
+            f'<text x="{left - 10}" y="{y + 4:.2f}" font-family="Arial, sans-serif" font-size="11" '
+            f'text-anchor="end" fill="#111827">{value:.4g}</text>'
+        )
+    for tick in range(6):
+        ratio = tick / 5
+        x = left + ratio * plot_w
+        value = round(x_min + ratio * x_span)
+        elements.append(f'<line x1="{x:.2f}" y1="{top}" x2="{x:.2f}" y2="{top + plot_h}" stroke="#f3f4f6" />')
+        elements.append(
+            f'<text x="{x:.2f}" y="{top + plot_h + 22}" font-family="Arial, sans-serif" font-size="11" '
+            f'text-anchor="middle" fill="#111827">{value}</text>'
+        )
+
+    elements.append(
+        f'<polyline points="{polyline}" fill="none" stroke="#2563eb" stroke-width="2.4" '
+        'stroke-linejoin="round" stroke-linecap="round" />'
+    )
+    elements.append(
+        f'<text x="{width / 2:.2f}" y="{height - 18}" font-family="Arial, sans-serif" font-size="13" '
+        'text-anchor="middle" fill="#111827">Training Step</text>'
+    )
+    elements.append(
+        f'<text x="18" y="{height / 2:.2f}" font-family="Arial, sans-serif" font-size="13" '
+        f'text-anchor="middle" fill="#111827">{escape(metric)}</text>'
+    )
+    elements.append("</svg>")
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text("\n".join(elements))
+
+
+def save_training_diagnostics(trainer: Any, output_dir: Path, phase: str) -> None:
+    log_rows = [
+        dict(row)
+        for row in getattr(trainer.state, "log_history", [])
+        if isinstance(row, Mapping) and row.get("step") is not None
+    ]
+    if not log_rows:
+        print(f"[{phase}] no trainer log history available for loss/metric plots", flush=True)
+        return
+
+    numeric_keys = sorted(
+        {
+            key
+            for row in log_rows
+            for key, value in row.items()
+            if key != "step" and _is_number(value)
+        }
+    )
+    fieldnames = ["step", *numeric_keys]
+    diagnostics_dir = output_dir / "training_diagnostics" / phase
+    _write_csv(diagnostics_dir / "trainer_log.csv", log_rows, fieldnames)
+
+    preferred_metrics = [
+        "loss",
+        "reward",
+        "rewards",
+        "mean_reward",
+        "kl",
+        "grad_norm",
+        "learning_rate",
+    ]
+    plotted = 0
+    for metric in preferred_metrics:
+        if metric not in numeric_keys:
+            continue
+        _save_metric_plot(
+            diagnostics_dir / f"{metric}.svg",
+            log_rows,
+            metric,
+            f"{phase.upper()} {metric} vs Training Step",
+        )
+        plotted += 1
+
+    print(
+        f"[{phase}] saved training diagnostics to {diagnostics_dir} "
+        f"(csv=trainer_log.csv, plots={plotted})",
+        flush=True,
     )
 
 
@@ -271,6 +418,7 @@ def run_sft_warmup(
     )
     trainer.train()
     trainer.save_model(str(output_dir / "sft_warmup"))
+    save_training_diagnostics(trainer, output_dir, "sft")
     return model
 
 
@@ -286,8 +434,8 @@ def run_grpo(
     print_every: int,
 ) -> None:
     if max_steps <= 0:
-      print("[grpo] skipped", flush=True)
-      return
+        print("[grpo] skipped", flush=True)
+        return
 
     per_device_batch_size = max(2, num_generations)
     config_kwargs = {
@@ -330,6 +478,7 @@ def run_grpo(
     )
     trainer.train()
     trainer.save_model(str(output_dir / "grpo_lora"))
+    save_training_diagnostics(trainer, output_dir, "grpo")
 
 
 def main() -> None:
