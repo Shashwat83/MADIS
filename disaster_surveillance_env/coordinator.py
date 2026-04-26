@@ -275,6 +275,9 @@ class HFRouterOpenAIBackend:
             or message_payload.get("reasoning_text")
         )
         text = "" if content is None else str(content)
+        if not text and reasoning_content:
+            text = str(reasoning_content)
+
         metadata = {
             "provider_base_url": self.base_url,
             "response_model": response_payload.get("model"),
@@ -417,10 +420,10 @@ class LLMCoordinator(CoordinatorAgent):
     def _ensure_backend(self) -> Optional[TextGenerationBackend]:
         if self.backend is not None:
             return self.backend
-    
+
         if self._backend_build_attempted:
             return None
-    
+
         self._backend_build_attempted = True
         self.backend = self._build_default_backend(self.model_name)
         return self.backend
