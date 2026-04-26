@@ -4,6 +4,7 @@ import argparse
 import csv
 from html import escape
 from pathlib import Path
+import os
 import sys
 import time
 from typing import Any, Dict, Iterable, List, Mapping, Sequence
@@ -90,10 +91,12 @@ def run_episodes(episodes: int, seed: int, level: int, episode_length: int | Non
             print(
                 "episode={episode}/{episodes} episode_time={episode_time:.1f}s elapsed={elapsed:.1f}s eta={eta:.1f}s "
                 "reward={reward:.1f} coverage={coverage:.1f}% detected={detected} missed={missed} "
-                "high_miss={high_miss:.2f} fallback_rate={fallback:.2f}".format(
+                "high_miss={high_miss:.2f} fallback_rate={fallback:.2f} source={source} fallback_reason={fallback_reason}".format(
                     episode=episode,
                     episodes=episodes,
                     episode_time=episode_time,
+                    source=metrics.get("coordinator_decision_source"),
+                    fallback_reason=metrics.get("coordinator_fallback_reason"),
                     elapsed=elapsed,
                     eta=remaining,
                     reward=metrics["total_reward"],
@@ -547,6 +550,9 @@ def main() -> None:
     output_dir = args.output_dir or default_output_dir(args.level, args.episodes)
 
     print(f"Configured model: {get_configured_model_name()}")
+    print(f"USE_LOCAL_QWEN={os.environ.get('USE_LOCAL_QWEN')}")
+    print(f"LOCAL_QWEN_ADAPTER_PATH={os.environ.get('LOCAL_QWEN_ADAPTER_PATH')}")
+
     print(f"Running Level {args.level} for {args.episodes} episodes.")
     metrics = run_episodes(
         episodes=args.episodes,

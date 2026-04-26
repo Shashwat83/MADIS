@@ -4,6 +4,7 @@ import argparse
 import json
 from pathlib import Path
 import sys
+import inspect
 import time
 from typing import Any, Dict, List, Mapping, Sequence
 
@@ -285,24 +286,41 @@ def run_grpo(
     num_generations: int,
     print_every: int,
 ) -> None:
+    if max_steps <= 0:
+      print("[grpo] skipped", flush=True)
+      return
+
     per_device_batch_size = max(2, num_generations)
-    args = imports["GRPOConfig"](
-        output_dir=str(output_dir / "grpo"),
-        max_steps=max_steps,
-        learning_rate=5e-6,
-        per_device_train_batch_size=per_device_batch_size,
-        gradient_accumulation_steps=2,
-        num_generations=num_generations,
-        max_prompt_length=1024,
-        max_completion_length=128,
-        temperature=0.7,
-        top_p=0.9,
-        beta=0.02,
-        fp16=True,
-        logging_steps=print_every,
-        save_steps=max_steps,
-        report_to=[],
-    )
+    config_kwargs = {
+        "output_dir": str(output_dir / "grpo"),
+        "max_steps": max_steps,
+        "learning_rate": 5e-6,
+        "per_device_train_batch_size": per_device_batch_size,
+        "gradient_accumulation_steps": 2,
+        "num_generations": num_generations,
+        "max_prompt_length": 1024,
+        "max_completion_length": 128,
+        "temperature": 0.7,
+        "top_p": 0.9,
+        "beta": 0.02,
+        "fp16": True,
+        "logging_steps": print_every,
+        "save_steps": max_steps,
+        "report_to": [],
+    }
+
+    accepted_args = set(inspect.signature(imports["GRPOConfig"].__init__).parameters)
+    filtered_kwargs = {
+        key: value for key, value in config_kwargs.items()
+        if key in accepted_args
+    }
+    dropped_args = sorted(set(config_kwargs) - set(filtered_kwargs))
+    if dropped_args:
+        print(f"[grpo] dropped unsupported GRPOConfig args: {dropped_args}", flush=True)
+
+    args = imports["GRPOConfig"](**filtered_kwargs)
+
+
     trainer = imports["GRPOTrainer"](
         model=model,
         args=args,

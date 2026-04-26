@@ -422,13 +422,18 @@ class LLMCoordinator(CoordinatorAgent):
     def _build_default_backend(self, model_name: str) -> Optional[TextGenerationBackend]:
         try:
             self._backend_error = None
+    
+            if os.environ.get("USE_LOCAL_QWEN", "").lower() == "true":
+                from .local_qwen_backend import LocalQwenBackend
+    
+                return LocalQwenBackend(model_name=model_name)
+    
             return HFRouterOpenAIBackend(model_name=model_name)
+    
         except Exception as exc:
             self._backend_error = f"{type(exc).__name__}: {exc}"
             return None
 
-    def _build_prompt(self, observation: Mapping[str, Any]) -> str:
-        return build_coordinator_prompt(observation)
 
     def _parse_targets(
         self,

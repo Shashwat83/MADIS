@@ -12,6 +12,9 @@ class LocalQwenBackend:
     def __init__(self, model_name: str = "Qwen/Qwen3-1.7B", adapter_path: str | None = None) -> None:
         self.model_name = model_name
         self.adapter_path = adapter_path or os.environ.get("LOCAL_QWEN_ADAPTER_PATH")
+        if self.adapter_path and not os.path.exists(self.adapter_path):
+          raise FileNotFoundError(f"LoRA adapter path does not exist: {self.adapter_path}")
+
         self.device = "cuda" if torch.cuda.is_available() else "cpu"
         print("Using device:", self.device)
 
