@@ -5,6 +5,7 @@ import csv
 from html import escape
 from pathlib import Path
 import sys
+import time
 from typing import Any, Dict, Iterable, List, Mapping, Sequence
 
 
@@ -63,18 +64,38 @@ def run_analysis_episode(seed: int, level: int = 6, episode_length: int | None =
 
 def run_episodes(episodes: int, seed: int, level: int, episode_length: int | None = None) -> List[Dict[str, Any]]:
     results: List[Dict[str, Any]] = []
+    started_at = time.perf_counter()
     for index in range(episodes):
         episode = index + 1
-        metrics = run_analysis_episode(seed=seed + index, level=level, episode_length=episode_length)
+        episode_started_at = time.perf_counter()
+        try:
+            metrics = run_analysis_episode(seed=seed + index, level=level, episode_length=episode_length)
+        except Exception as exc:
+            elapsed = time.perf_counter() - started_at
+            print(
+                f"[ERROR] analysis failed at episode={episode}/{episodes} "
+                f"after {elapsed:.1f}s: {type(exc).__name__}: {exc}",
+                file=sys.stderr,
+            )
+            raise SystemExit(1) from exc
+
         metrics["episode"] = episode
         metrics["seed"] = seed + index
         results.append(metrics)
-        if episode == 1 or episode % 25 == 0 or episode == episodes:
+        if episode == 1 or episode % 5 == 0 or episode == episodes:
+            elapsed = time.perf_counter() - started_at
+            avg_episode_time = elapsed / float(episode)
+            remaining = max(0, episodes - episode) * avg_episode_time
+            episode_time = time.perf_counter() - episode_started_at
             print(
-                "episode={episode}/{episodes} reward={reward:.1f} coverage={coverage:.1f}% "
-                "detected={detected} missed={missed} high_miss={high_miss:.2f} fallback_rate={fallback:.2f}".format(
+                "episode={episode}/{episodes} episode_time={episode_time:.1f}s elapsed={elapsed:.1f}s eta={eta:.1f}s "
+                "reward={reward:.1f} coverage={coverage:.1f}% detected={detected} missed={missed} "
+                "high_miss={high_miss:.2f} fallback_rate={fallback:.2f}".format(
                     episode=episode,
                     episodes=episodes,
+                    episode_time=episode_time,
+                    elapsed=elapsed,
+                    eta=remaining,
                     reward=metrics["total_reward"],
                     coverage=metrics["grid_coverage_percent"],
                     detected=metrics["events_detected"],

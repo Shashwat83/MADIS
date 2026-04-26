@@ -1,6 +1,8 @@
 from __future__ import annotations
 
 import argparse
+import sys
+import time
 from typing import Any, Dict, Mapping, Optional, Sequence
 from uuid import uuid4
 
@@ -820,24 +822,45 @@ def run_random_episodes(
         raise ValueError(f"episodes must be >= 1; got {episodes}.")
 
     all_metrics: list[Dict[str, Any]] = []
+    started_at = time.perf_counter()
     for episode_index in range(episodes):
         episode_seed = seed + episode_index
-        metrics = run_random_episode(
-            seed=episode_seed,
-            render=render and episodes == 1,
-            level=level,
-            verbose=episodes == 1,
-            episode_length=episode_length,
-        )
-        all_metrics.append(metrics)
-        if episodes > 1:
+        episode_number = episode_index + 1
+        episode_started_at = time.perf_counter()
+        try:
+            metrics = run_random_episode(
+                seed=episode_seed,
+                render=render and episodes == 1,
+                level=level,
+                verbose=episodes == 1,
+                episode_length=episode_length,
+            )
+        except Exception as exc:
+            elapsed = time.perf_counter() - started_at
             print(
-                "episode={episode} seed={seed} level={level} total_reward={reward:.1f} "
+                f"[ERROR] rollout failed at episode={episode_number}/{episodes} "
+                f"after {elapsed:.1f}s: {type(exc).__name__}: {exc}",
+                file=sys.stderr,
+            )
+            raise
+        all_metrics.append(metrics)
+        if episodes > 1 and (episode_number == 1 or episode_number % 5 == 0 or episode_number == episodes):
+            elapsed = time.perf_counter() - started_at
+            avg_episode_time = elapsed / float(episode_number)
+            remaining = max(0, episodes - episode_number) * avg_episode_time
+            episode_time = time.perf_counter() - episode_started_at
+            print(
+                "episode={episode}/{episodes} seed={seed} level={level} episode_time={episode_time:.1f}s "
+                "elapsed={elapsed:.1f}s eta={eta:.1f}s total_reward={reward:.1f} "
                 "detected={detected} missed={missed} high_miss_rate={high_miss:.2f} "
                 "coverage={coverage:.1f}% path_efficiency={path_efficiency:.2f}".format(
-                    episode=episode_index + 1,
+                    episode=episode_number,
+                    episodes=episodes,
                     seed=episode_seed,
                     level=level,
+                    episode_time=episode_time,
+                    elapsed=elapsed,
+                    eta=remaining,
                     reward=metrics["total_reward"],
                     detected=metrics["events_detected"],
                     missed=metrics["events_missed"],

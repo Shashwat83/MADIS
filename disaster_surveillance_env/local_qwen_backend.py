@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+import os
+
 import torch
 from transformers import AutoModelForCausalLM, AutoTokenizer
 
@@ -7,8 +9,9 @@ from transformers import AutoModelForCausalLM, AutoTokenizer
 class LocalQwenBackend:
     """Local Qwen text-generation backend compatible with LLMCoordinator."""
 
-    def __init__(self, model_name: str = "Qwen/Qwen3-1.7B") -> None:
+    def __init__(self, model_name: str = "Qwen/Qwen3-1.7B", adapter_path: str | None = None) -> None:
         self.model_name = model_name
+        self.adapter_path = adapter_path or os.environ.get("LOCAL_QWEN_ADAPTER_PATH")
         self.device = "cuda" if torch.cuda.is_available() else "cpu"
         print("Using device:", self.device)
 
@@ -22,6 +25,17 @@ class LocalQwenBackend:
             device_map=None,
             token=True,
         )
+        if self.adapter_path:
+            try:
+                from peft import PeftModel
+            except Exception as exc:
+                raise RuntimeError(
+                    "LOCAL_QWEN_ADAPTER_PATH is set, but peft is not installed. "
+                    "Install the llm extra or run: pip install peft"
+                ) from exc
+
+            print("Loading LoRA adapter:", self.adapter_path)
+            self.model = PeftModel.from_pretrained(self.model, self.adapter_path)
         self.model.to(self.device)
         self.model.eval()
 

@@ -11,5 +11,7 @@ __pycache__/
 outputs/logs/*
 outputs/evals/*
 outputs/matplotlib_cache/
+outputs/qwen3_grpo_coordinator*/
+outputs/*_grpo*/
 !outputs/logs/.gitkeep
 !outputs/evals/.gitkeep

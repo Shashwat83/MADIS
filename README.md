@@ -70,6 +70,30 @@ Run the 400-episode baseline analysis and cache CSV/SVG plot data:
 python3 scripts/analyze_baseline.py --episodes 400
 ```
 
+Train the local Qwen coordinator with optional SFT warmup and GRPO on Colab:
+
+```bash
+pip install -U "transformers>=4.45.0" "trl>=0.14.0" peft accelerate bitsandbytes datasets
+pip install -e ".[llm]"
+python3 scripts/train_grpo_coordinator.py \
+  --model Qwen/Qwen3-1.7B \
+  --output-dir outputs/qwen3_grpo_coordinator \
+  --num-prompts 1024 \
+  --episode-length 10 \
+  --sft-steps 100 \
+  --grpo-steps 300 \
+  --num-generations 2
+```
+
+Evaluate the trained LoRA coordinator locally:
+
+```bash
+export USE_LOCAL_QWEN=true
+export HF_COORDINATOR_MODEL=Qwen/Qwen3-1.7B
+export LOCAL_QWEN_ADAPTER_PATH=outputs/qwen3_grpo_coordinator/grpo_lora
+python3 scripts/analyze_baseline.py --level 6 --episodes 400
+```
+
 Run tests:
 
 ```bash
