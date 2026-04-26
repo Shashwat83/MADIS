@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import argparse
+import csv
 from pathlib import Path
 from typing import Any, Optional
 import sys
@@ -11,6 +12,8 @@ if str(ROOT) not in sys.path:
     sys.path.insert(0, str(ROOT))
 
 from disaster_surveillance_env.coordinator import get_configured_model_name
+from disaster_surveillance_env.grpo.eval import run_backend_eval
+from disaster_surveillance_env.grpo.local_peft_backend import LoadedPeftCoordinatorBackend
 from disaster_surveillance_env.hf_hub_auth import from_pretrained_token_kwargs
 from disaster_surveillance_env.sft.training import (
     DEFAULT_LORA_TARGET_MODULES,
@@ -21,6 +24,7 @@ from disaster_surveillance_env.sft.training import (
     save_json,
     truncate_prompt_completion,
 )
+from scripts.analyze_baseline import save_line_plot
 
 def _import_training_stack() -> dict[str, Any]:
     try:
@@ -33,6 +37,7 @@ def _import_training_stack() -> dict[str, Any]:
             BitsAndBytesConfig,
             DataCollatorForSeq2Seq,
             Trainer,
+            TrainerCallback,
             TrainingArguments,
         )
     except ImportError as exc:  # pragma: no cover - depends on optional local deps
@@ -52,8 +57,154 @@ def _import_training_stack() -> dict[str, Any]:
         "BitsAndBytesConfig": BitsAndBytesConfig,
         "DataCollatorForSeq2Seq": DataCollatorForSeq2Seq,
         "Trainer": Trainer,
+        "TrainerCallback": TrainerCallback,
         "TrainingArguments": TrainingArguments,
     }
+
+
+def _append_csv_row(path: Path, fieldnames: list[str], row: dict[str, Any]) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    write_header = not path.exists()
+    with path.open("a", newline="", encoding="utf-8") as handle:
+        writer = csv.DictWriter(handle, fieldnames=fieldnames)
+        if write_header:
+            writer.writeheader()
+        writer.writerow({name: row.get(name) for name in fieldnames})
+
+
+def _save_sft_monitoring_plots(training_csv: Path, env_eval_csv: Path, output_dir: Path) -> None:
+    plot_dir = output_dir / "plots"
+    plot_dir.mkdir(parents=True, exist_ok=True)
+
+    if training_csv.exists():
+        rows: list[dict[str, Any]] = []
+        with training_csv.open("r", encoding="utf-8") as handle:
+            rows.extend(csv.DictReader(handle))
+        steps = [int(float(row["step"])) for row in rows if row.get("step")]
+        train_loss = [float(row["loss"]) for row in rows if row.get("loss")]
+        train_loss_steps = [int(float(row["step"])) for row in rows if row.get("loss")]
+        eval_loss = [float(row["eval_loss"]) for row in rows if row.get("eval_loss")]
+        eval_loss_steps = [int(float(row["step"])) for row in rows if row.get("eval_loss")]
+        if train_loss:
+            save_line_plot(plot_dir / "sft_train_loss.svg", train_loss_steps, {"train_loss": train_loss}, "SFT Train Loss vs Step", "Loss", smooth=False)
+        if eval_loss:
+            save_line_plot(plot_dir / "sft_eval_loss.svg", eval_loss_steps, {"eval_loss": eval_loss}, "SFT Eval Loss vs Step", "Loss", smooth=False)
+
+    if env_eval_csv.exists():
+        rows = []
+        with env_eval_csv.open("r", encoding="utf-8") as handle:
+            rows.extend(csv.DictReader(handle))
+        steps = [int(float(row["step"])) for row in rows if row.get("step")]
+        if not steps:
+            return
+        reward = [float(row["mean_total_reward"]) for row in rows]
+        miss = [float(row["mean_high_priority_miss_rate"]) for row in rows]
+        coverage = [float(row["mean_grid_coverage_percent"]) for row in rows]
+        path_eff = [float(row["mean_path_efficiency"]) for row in rows]
+        save_line_plot(plot_dir / "sft_reward.svg", steps, {"mean_total_reward": reward}, "SFT Env Reward vs Step", "Reward", smooth=False)
+        save_line_plot(plot_dir / "sft_high_priority_miss_rate.svg", steps, {"mean_high_priority_miss_rate": miss}, "SFT High-Priority Miss Rate vs Step", "Miss Rate", smooth=False)
+        save_line_plot(plot_dir / "sft_coverage.svg", steps, {"mean_grid_coverage_percent": coverage}, "SFT Coverage vs Step", "Coverage %", smooth=False)
+        save_line_plot(plot_dir / "sft_path_efficiency.svg", steps, {"mean_path_efficiency": path_eff}, "SFT Path Efficiency vs Step", "Path Efficiency", smooth=False)
+
+
+def _summarize_eval(metrics: list[dict[str, Any]]) -> dict[str, Any]:
+    episode_count = len(metrics)
+    return {
+        "episodes": episode_count,
+        "mean_total_reward": sum(float(row["total_reward"]) for row in metrics) / float(episode_count or 1),
+        "mean_grid_coverage_percent": sum(float(row["grid_coverage_percent"]) for row in metrics) / float(episode_count or 1),
+        "mean_high_priority_miss_rate": sum(float(row["high_priority_miss_rate"]) for row in metrics) / float(episode_count or 1),
+        "mean_on_time_detection_rate": sum(float(row["on_time_detection_rate"]) for row in metrics) / float(episode_count or 1),
+        "mean_path_efficiency": sum(float(row.get("derived_path_efficiency", 0.0)) for row in metrics) / float(episode_count or 1),
+    }
+
+
+def _make_sft_callback(
+    *,
+    trainer_callback_base: type,
+    output_dir: Path,
+    model_name: str,
+    tokenizer: Any,
+    eval_seed: int,
+    intermediate_eval_episodes: int,
+    final_eval_episodes: int,
+    episode_length: int,
+    torch_module: Any,
+):
+    class MADISSFTCallback(trainer_callback_base):
+        def __init__(self) -> None:
+            self.training_csv = output_dir / "training" / "sft_training_metrics.csv"
+            self.env_eval_csv = output_dir / "training" / "sft_env_eval_summary.csv"
+
+        def on_log(self, args, state, control, logs=None, **kwargs):
+            if not state.is_local_process_zero or logs is None:
+                return
+            row = {
+                "step": int(state.global_step),
+                "epoch": logs.get("epoch"),
+                "loss": logs.get("loss"),
+                "eval_loss": logs.get("eval_loss"),
+                "grad_norm": logs.get("grad_norm"),
+                "learning_rate": logs.get("learning_rate"),
+            }
+            _append_csv_row(self.training_csv, list(row.keys()), row)
+            _save_sft_monitoring_plots(self.training_csv, self.env_eval_csv, output_dir / "training")
+
+        def on_evaluate(self, args, state, control, model=None, processing_class=None, **kwargs):
+            if not state.is_local_process_zero or int(state.global_step) <= 0:
+                return
+            backend = LoadedPeftCoordinatorBackend(
+                model=model,
+                tokenizer=processing_class or tokenizer,
+                torch_module=torch_module,
+            )
+            step = int(state.global_step)
+            eval_dir = output_dir / "env_eval" / f"step_{step:05d}"
+            metrics = run_backend_eval(
+                backend=backend,
+                model_name=model_name,
+                episodes=intermediate_eval_episodes,
+                seed=eval_seed + step,
+                output_dir=eval_dir,
+                episode_length=episode_length,
+            )
+            summary = _summarize_eval(metrics)
+            row = {"step": step, **summary}
+            _append_csv_row(self.env_eval_csv, list(row.keys()), row)
+            _save_sft_monitoring_plots(self.training_csv, self.env_eval_csv, output_dir / "training")
+            print(
+                "[sft-env-eval] step={step} mean_reward={reward:.3f} high_miss={miss:.3f} coverage={coverage:.2f}".format(
+                    step=step,
+                    reward=summary["mean_total_reward"],
+                    miss=summary["mean_high_priority_miss_rate"],
+                    coverage=summary["mean_grid_coverage_percent"],
+                )
+            )
+
+        def on_train_end(self, args, state, control, model=None, processing_class=None, **kwargs):
+            if not state.is_local_process_zero:
+                return
+            backend = LoadedPeftCoordinatorBackend(
+                model=model,
+                tokenizer=processing_class or tokenizer,
+                torch_module=torch_module,
+            )
+            step = int(state.global_step)
+            eval_dir = output_dir / "env_eval" / f"final_step_{step:05d}"
+            metrics = run_backend_eval(
+                backend=backend,
+                model_name=model_name,
+                episodes=final_eval_episodes,
+                seed=eval_seed,
+                output_dir=eval_dir,
+                episode_length=episode_length,
+            )
+            summary = _summarize_eval(metrics)
+            row = {"step": step, **summary}
+            _append_csv_row(self.env_eval_csv, list(row.keys()), row)
+            _save_sft_monitoring_plots(self.training_csv, self.env_eval_csv, output_dir / "training")
+
+    return MADISSFTCallback
 
 
 def _select_torch_dtype(torch_module: Any, *, bf16: bool, fp16: bool) -> Any:
@@ -153,6 +304,11 @@ def run_training(args: argparse.Namespace) -> None:
         "use_4bit": args.use_4bit,
         "gradient_checkpointing": args.gradient_checkpointing,
         "seed": args.seed,
+        "enable_env_eval": args.enable_env_eval,
+        "env_eval_episodes": args.env_eval_episodes,
+        "final_env_eval_episodes": args.final_env_eval_episodes,
+        "env_eval_seed": args.env_eval_seed,
+        "env_eval_episode_length": args.env_eval_episode_length,
     }
 
     manifest = build_run_manifest(
@@ -182,6 +338,7 @@ def run_training(args: argparse.Namespace) -> None:
     BitsAndBytesConfig = stack["BitsAndBytesConfig"]
     DataCollatorForSeq2Seq = stack["DataCollatorForSeq2Seq"]
     Trainer = stack["Trainer"]
+    TrainerCallback = stack["TrainerCallback"]
     TrainingArguments = stack["TrainingArguments"]
 
     train_dataset = load_dataset("json", data_files=str(args.train_jsonl), split="train")
@@ -284,6 +441,21 @@ def run_training(args: argparse.Namespace) -> None:
         length_column_name="sequence_length",
     )
 
+    callbacks = []
+    if args.enable_env_eval:
+        callback_cls = _make_sft_callback(
+            trainer_callback_base=TrainerCallback,
+            output_dir=run_paths.root,
+            model_name=args.model_name,
+            tokenizer=tokenizer,
+            eval_seed=args.env_eval_seed,
+            intermediate_eval_episodes=args.env_eval_episodes,
+            final_eval_episodes=args.final_env_eval_episodes,
+            episode_length=args.env_eval_episode_length or args.sft_eval_episode_length or 50,
+            torch_module=torch,
+        )
+        callbacks.append(callback_cls())
+
     trainer = Trainer(
         model=model,
         args=training_arguments,
@@ -291,6 +463,7 @@ def run_training(args: argparse.Namespace) -> None:
         eval_dataset=eval_dataset,
         data_collator=data_collator,
         processing_class=tokenizer,
+        callbacks=callbacks,
     )
     trainer.train(resume_from_checkpoint=args.resume_from_checkpoint)
     _save_run_artifacts(
@@ -348,6 +521,12 @@ def main() -> None:
     parser.add_argument("--resume-from-checkpoint", type=str, default=None)
     parser.add_argument("--load-best-model-at-end", action="store_true")
     parser.add_argument("--export-merged-model", action="store_true")
+    parser.add_argument("--enable-env-eval", action=argparse.BooleanOptionalAction, default=True)
+    parser.add_argument("--env-eval-episodes", type=int, default=5)
+    parser.add_argument("--final-env-eval-episodes", type=int, default=25)
+    parser.add_argument("--env-eval-seed", type=int, default=1000)
+    parser.add_argument("--env-eval-episode-length", type=int, default=None)
+    parser.add_argument("--sft-eval-episode-length", type=int, default=None)
     parser.add_argument("--dry-run", action="store_true", help="Validate dataset shape without launching training.")
     args = parser.parse_args()
     run_training(args)
