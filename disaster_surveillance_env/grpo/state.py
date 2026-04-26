@@ -17,9 +17,11 @@ class EnvironmentSnapshot:
     episode_length: int
     timestep: int
     next_event_id: int
+    next_report_id: int
     rng_state: Dict[str, Any]
     drones: List[Dict[str, Any]]
     events: List[Dict[str, Any]]
+    reported_events: List[Dict[str, Any]]
     visited_cells: List[tuple[int, int]]
     metrics: Dict[str, Any]
     last_reward: float
@@ -38,6 +40,7 @@ def snapshot_environment(env: DisasterSurveillanceEnvironment) -> Dict[str, Any]
             episode_length=env.episode_length,
             timestep=env.timestep,
             next_event_id=env.next_event_id,
+            next_report_id=env.next_report_id,
             rng_state=dict(env.rng.bit_generator.state),
             drones=[
                 {
@@ -53,18 +56,8 @@ def snapshot_environment(env: DisasterSurveillanceEnvironment) -> Dict[str, Any]
                 }
                 for drone in env.drones.values()
             ],
-            events=[
-                {
-                    "id": event.id,
-                    "location": event.location,
-                    "start_time": event.start_time,
-                    "duration": event.duration,
-                    "severity": event.severity,
-                    "detected": event.detected,
-                    "detection_time": event.detection_time,
-                }
-                for event in env.events
-            ],
+            events=[asdict(event) for event in env.events],
+            reported_events=[dict(report) for report in env.reported_events],
             visited_cells=sorted(env.visited_cells),
             metrics=_deep_copy_metrics(env.metrics),
             last_reward=float(env._last_reward),
@@ -92,6 +85,7 @@ def restore_environment(
     env.episode_id = snapshot.get("episode_id")
     env.timestep = int(snapshot["timestep"])
     env.next_event_id = int(snapshot["next_event_id"])
+    env.next_report_id = int(snapshot.get("next_report_id", 1))
     env.rng = np.random.default_rng()
     env.rng.bit_generator.state = dict(snapshot["rng_state"])
     env.drones = {
@@ -108,24 +102,19 @@ def restore_environment(
         )
         for drone_payload in snapshot["drones"]
     }
-    env.events = [
-        Event(
-            id=int(event_payload["id"]),
-            location=tuple(event_payload["location"]),
-            start_time=int(event_payload["start_time"]),
-            duration=int(event_payload["duration"]),
-            severity=str(event_payload["severity"]),
-            detected=bool(event_payload["detected"]),
-            detection_time=(
-                int(event_payload["detection_time"])
-                if event_payload["detection_time"] is not None
-                else None
-            ),
-        )
-        for event_payload in snapshot["events"]
+    env.events = [Event(**{**event_payload, "location": tuple(event_payload["location"])}) for event_payload in snapshot["events"]]
+    env.reported_events = [
+        {
+            **dict(report_payload),
+            "location": tuple(report_payload["location"]),
+        }
+        for report_payload in snapshot.get("reported_events", [])
     ]
     env.visited_cells = {tuple(cell) for cell in snapshot["visited_cells"]}
     env.metrics = _deep_copy_metrics(snapshot["metrics"])
+    investigated_report_ids = env.metrics.get("_investigated_false_report_ids")
+    if isinstance(investigated_report_ids, list):
+        env.metrics["_investigated_false_report_ids"] = set(str(item) for item in investigated_report_ids)
     env._last_reward = float(snapshot["last_reward"])
     env._episode_bonus_applied = bool(snapshot["episode_bonus_applied"])
     env._recently_observed_cells = [tuple(cell) for cell in snapshot["recently_observed_cells"]]
@@ -143,6 +132,8 @@ def _deep_copy_metrics(metrics: Mapping[str, Any]) -> Dict[str, Any]:
             copied[key] = _deep_copy_metrics(value)
         elif isinstance(value, list):
             copied[key] = list(value)
+        elif isinstance(value, set):
+            copied[key] = sorted(value)
         else:
             copied[key] = value
     return copied

@@ -95,6 +95,21 @@ def build_coordinator_prompt(
         "Recent team coverage ratio: {:.2f}".format(float(observation.get("recent_team_coverage_ratio", 0.0)))
     )
 
+    reported_events = list(observation.get("reported_events", []))
+    if reported_events:
+        header.append("")
+        header.append("Reported incidents (may include false positives):")
+        for report in reported_events:
+            header.append(
+                "- id={id} type={type} severity={severity} credibility={credibility:.2f} location={location}".format(
+                    id=report["id"],
+                    type=report.get("type", "unknown"),
+                    severity=report.get("severity", "LOW"),
+                    credibility=float(report.get("credibility", 0.0)),
+                    location=tuple(report["location"]),
+                )
+            )
+
     if hotspots:
         header.append("")
         header.append(f"Hotspots: {json.dumps(_summarize_hotspots(hotspots), separators=(',', ':'))}")
@@ -114,6 +129,8 @@ def build_coordinator_prompt(
             [
                 "Assign one target grid cell to each drone.",
                 "Prioritize HIGH severity events, then MEDIUM, then LOW.",
+                "Prioritize confirmed visible events before uncertain reports.",
+                "Treat low-credibility reports as leads to verify, not guaranteed emergencies.",
                 "Avoid assigning the same target to multiple drones unless necessary.",
                 "Return JSON only.",
                 "Return exactly one valid JSON object and nothing else.",

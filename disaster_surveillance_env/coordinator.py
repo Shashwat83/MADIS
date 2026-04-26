@@ -8,7 +8,7 @@ from typing import Any, Dict, List, Mapping, Optional, Protocol, Sequence, Tuple
 
 from dotenv import load_dotenv
 
-from .models import Coord, manhattan_distance
+from .models import Coord, event_type_priority, manhattan_distance
 from .sft.parsing import parse_target_json
 from .sft.prompting import TARGET_OUTPUT_MODE, build_coordinator_prompt
 
@@ -70,6 +70,7 @@ class HeuristicCoordinator(CoordinatorAgent):
     def decide(self, observation: Mapping[str, Any]) -> CoordinatorDecision:
         drone_positions: Mapping[str, Coord] = observation["drone_positions"]
         visible_events: Sequence[Mapping[str, Any]] = observation.get("visible_active_events", [])
+        reported_events: Sequence[Mapping[str, Any]] = observation.get("reported_events", [])
         frontier_cells: Sequence[Coord] = observation.get("team_frontier_cells", [])
         grid_size = int(observation.get("grid_size", 10))
 
@@ -88,6 +89,12 @@ class HeuristicCoordinator(CoordinatorAgent):
             if event_target is not None:
                 remaining_targets[drone_id] = event_target
                 assigned_cells.add(event_target)
+                continue
+
+            report_target = self._select_report_target(position, reported_events, assigned_cells)
+            if report_target is not None:
+                remaining_targets[drone_id] = report_target
+                assigned_cells.add(report_target)
                 continue
 
             frontier_target = self._select_frontier_target(position, frontier_cells, assigned_cells)
@@ -118,6 +125,29 @@ class HeuristicCoordinator(CoordinatorAgent):
             tuple(event["location"])
             for event in prioritized_events
             if tuple(event["location"]) not in assigned_cells
+        ]
+        if not available:
+            return None
+        return min(available, key=lambda location: manhattan_distance(position, location))
+
+    def _select_report_target(
+        self,
+        position: Coord,
+        reported_events: Sequence[Mapping[str, Any]],
+        assigned_cells: set[Coord],
+    ) -> Coord | None:
+        prioritized_reports = sorted(
+            reported_events,
+            key=lambda report: (
+                -int(report.get("type_priority", event_type_priority(str(report.get("type", "road_blockage"))))),
+                -float(report.get("credibility", 0.0)),
+                self.SEVERITY_PRIORITY.get(str(report.get("severity", "LOW")), 99),
+            ),
+        )
+        available = [
+            tuple(report["location"])
+            for report in prioritized_reports
+            if tuple(report["location"]) not in assigned_cells
         ]
         if not available:
             return None

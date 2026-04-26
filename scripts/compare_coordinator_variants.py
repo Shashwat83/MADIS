@@ -42,7 +42,7 @@ def _load_grpo_reuse(sft_run_dir: Path) -> Dict[str, Any]:
 
 def _summarize(metrics: Sequence[Mapping[str, Any]]) -> Dict[str, Any]:
     count = len(metrics)
-    return {
+    summary = {
         "episodes": count,
         "mean_total_reward": sum(float(row["total_reward"]) for row in metrics) / float(count or 1),
         "mean_high_priority_miss_rate": sum(float(row["high_priority_miss_rate"]) for row in metrics) / float(count or 1),
@@ -50,6 +50,20 @@ def _summarize(metrics: Sequence[Mapping[str, Any]]) -> Dict[str, Any]:
         "mean_grid_coverage_percent": sum(float(row["grid_coverage_percent"]) for row in metrics) / float(count or 1),
         "mean_path_efficiency": sum(float(row.get("derived_path_efficiency", 0.0)) for row in metrics) / float(count or 1),
     }
+    if any("false_report_rejection_rate" in row for row in metrics):
+        summary.update(
+            {
+                "mean_false_report_rejection_rate": sum(float(row.get("false_report_rejection_rate", 0.0)) for row in metrics)
+                / float(count or 1),
+                "mean_false_reports_issued": sum(float(row.get("false_reports_issued", 0.0)) for row in metrics)
+                / float(count or 1),
+                "mean_false_report_investigations": sum(float(row.get("false_report_investigations", 0.0)) for row in metrics)
+                / float(count or 1),
+                "mean_total_false_report_penalty": sum(float(row.get("total_false_report_penalty", 0.0)) for row in metrics)
+                / float(count or 1),
+            }
+        )
+    return summary
 
 
 def _run_eval(
@@ -136,6 +150,15 @@ def _plot_comparison(output_dir: Path, *, per_variant: Mapping[str, Sequence[Map
         "Path Efficiency",
         smooth=False,
     )
+    if any(any("false_report_rejection_rate" in row for row in rows) for rows in per_variant.values()):
+        save_line_plot(
+            plot_dir / "false_report_rejection_rate.svg",
+            episodes,
+            series_for("false_report_rejection_rate"),
+            "False Report Rejection Rate vs Episode",
+            "Rejection Rate",
+            smooth=False,
+        )
 
 
 def main() -> None:
@@ -290,4 +313,3 @@ def main() -> None:
 
 if __name__ == "__main__":
     main()
-

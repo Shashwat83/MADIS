@@ -154,6 +154,31 @@ def test_level6_rejects_direct_drone_actions() -> None:
         raise AssertionError("Level 6 should reject direct movement actions.")
 
 
+def test_level9_step_supports_coordinator_reports_and_openenv_flow() -> None:
+    env = DisasterSurveillanceEnvironment(level=9, seed=4, p_spawn=0.0, coordinator=HeuristicCoordinator())
+    env.reset(seed=4)
+    env.reported_events = [
+        {
+            "id": "report_1",
+            "location": (1, 1),
+            "severity": "HIGH",
+            "type": "riot",
+            "type_priority": 6,
+            "severity_score": 2.8,
+            "credibility": 0.55,
+            "reported_at": 0,
+            "expires_at": 6,
+            "source": "scripted_adversary",
+        }
+    ]
+
+    observation = env.step(None)
+
+    assert observation.coordinator is not None
+    assert "reported_events" in observation.coordinator
+    assert observation.metadata["coordination_mode"] == "centralized_coordinator"
+
+
 def test_llm_coordinator_parses_json_targets() -> None:
     class FakeBackend:
         def generate(self, prompt: str) -> str:

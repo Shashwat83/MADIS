@@ -155,7 +155,7 @@ def _consume_eval_trigger(episodes_seen: int, next_trigger: int, every: int) -> 
 
 def _summarize_eval(metrics: List[Dict[str, Any]]) -> Dict[str, Any]:
     episode_count = len(metrics)
-    return {
+    summary = {
         "episodes": episode_count,
         "mean_total_reward": sum(float(row["total_reward"]) for row in metrics) / float(episode_count or 1),
         "mean_grid_coverage_percent": sum(float(row["grid_coverage_percent"]) for row in metrics) / float(episode_count or 1),
@@ -163,6 +163,20 @@ def _summarize_eval(metrics: List[Dict[str, Any]]) -> Dict[str, Any]:
         "mean_on_time_detection_rate": sum(float(row["on_time_detection_rate"]) for row in metrics) / float(episode_count or 1),
         "mean_path_efficiency": sum(float(row.get("derived_path_efficiency", 0.0)) for row in metrics) / float(episode_count or 1),
     }
+    if any("false_report_rejection_rate" in row for row in metrics):
+        summary.update(
+            {
+                "mean_false_report_rejection_rate": sum(float(row.get("false_report_rejection_rate", 0.0)) for row in metrics)
+                / float(episode_count or 1),
+                "mean_false_reports_issued": sum(float(row.get("false_reports_issued", 0.0)) for row in metrics)
+                / float(episode_count or 1),
+                "mean_false_report_investigations": sum(float(row.get("false_report_investigations", 0.0)) for row in metrics)
+                / float(episode_count or 1),
+                "mean_total_false_report_penalty": sum(float(row.get("total_false_report_penalty", 0.0)) for row in metrics)
+                / float(episode_count or 1),
+            }
+        )
+    return summary
 
 
 def _make_callback(

@@ -54,6 +54,8 @@ class DisasterSurveillanceEnvironment(
     LATENCY_BONUS_THRESHOLD = 3.0
     COORDINATOR_RECENT_MEMORY = 25
     MAX_SPREAD_EVENTS_PER_STEP = 12
+    FALSE_REPORT_MEMORY_LIMIT = 6
+    FALSE_REPORT_MAX_ACTIVE = 3
 
     def __init__(
         self,
@@ -68,14 +70,14 @@ class DisasterSurveillanceEnvironment(
         coordinator: Optional[CoordinatorAgent] = None,
     ) -> None:
         super().__init__()
-        if level not in {3, 4, 5, 6}:
-            raise ValueError(f"level must be 3, 4, 5, or 6; got {level}.")
+        if level not in {3, 4, 5, 6, 9}:
+            raise ValueError(f"level must be 3, 4, 5, 6, or 9; got {level}.")
 
         self.level = level
         self.grid_size = grid_size
         self.episode_length = episode_length
         self.agent_ids = [f"drone_{index + 1}" for index in range(n_drones)]
-        self.coordinator = coordinator or (LLMCoordinator() if level == 6 else None)
+        self.coordinator = coordinator or (LLMCoordinator() if level in {6, 9} else None)
         self.action_space: Dict[str, Any] = (
             {
                 "type": "multi_agent_target_assignment",
@@ -83,7 +85,7 @@ class DisasterSurveillanceEnvironment(
                 "target_shape": [2],
                 "description": "Coordinator-assigned target coordinates for each drone.",
             }
-            if self.level == 6
+            if self.level in {6, 9}
             else {
                 "type": "multi_agent_discrete",
                 "agents": self.agent_ids,
@@ -93,7 +95,7 @@ class DisasterSurveillanceEnvironment(
         )
         self.observation_space: Dict[str, Any] = {
             "type": "per_agent_partial_observation",
-            "coordination": "centralized_coordinator" if self.level == 6 else "decentralized",
+            "coordination": "centralized_coordinator" if self.level in {6, 9} else "decentralized",
             "communication": "none",
             "reward_mode": self.reward_mode,
             "agents": self.agent_ids,
@@ -130,6 +132,7 @@ class DisasterSurveillanceEnvironment(
                     "timestep",
                     "drone_positions",
                     "visible_active_events",
+                    "reported_events",
                     "known_detected_events",
                     "team_frontier_cells",
                     "recently_observed_cells",
@@ -145,6 +148,7 @@ class DisasterSurveillanceEnvironment(
         self.next_event_id = 1
         self.drones: Dict[str, Drone] = {}
         self.events: list[Event] = []
+        self.reported_events: list[Dict[str, Any]] = []
         self.visited_cells: set[Coord] = set()
         self.metrics: Dict[str, Any] = {}
         self._last_reward = 0.0
@@ -152,6 +156,7 @@ class DisasterSurveillanceEnvironment(
         self._recently_observed_cells: list[Coord] = []
         self.last_assigned_targets: Dict[str, Coord] = {}
         self.last_coordinator_observation: Dict[str, Any] = {}
+        self.next_report_id = 1
         self.reset(seed=seed)
 
     def get_metadata(self) -> EnvironmentMetadata:
@@ -160,6 +165,7 @@ class DisasterSurveillanceEnvironment(
             4: "Level 4 decentralized coordination environment with implicit FOV overlap and coverage reward shaping.",
             5: "Level 5 long-horizon disaster surveillance with urgency, prioritization, delayed rewards, and hotspot-biased event spawning.",
             6: "Level 6 coordinator-driven disaster surveillance with centralized target assignment and drone execution toward goals.",
+            9: "Level 9 coordinator-driven surveillance with adversarial false-positive reports and trust-aware target assignment.",
         }
         return EnvironmentMetadata(
             name="disaster-surveillance-grid",
@@ -175,6 +181,8 @@ class DisasterSurveillanceEnvironment(
             return "shared_global_overlap_and_coverage_shaping"
         if self.level == 5:
             return "shared_global_long_horizon_priority_shaping"
+        if self.level == 9:
+            return "shared_global_coordinator_adversarial_priority_shaping"
         return "shared_global_coordinator_priority_shaping"
 
     @property
@@ -233,11 +241,13 @@ class DisasterSurveillanceEnvironment(
         self.timestep = 0
         self.next_event_id = 1
         self.events = []
+        self.reported_events = []
         self.visited_cells = set()
         self._episode_bonus_applied = False
         self._recently_observed_cells = []
         self.last_assigned_targets = {}
         self.last_coordinator_observation = {}
+        self.next_report_id = 1
         self.drones = {
             drone_id: Drone(
                 id=drone_id,
@@ -255,7 +265,7 @@ class DisasterSurveillanceEnvironment(
         latency_lists = {severity: [] for severity in SEVERITY_CONFIG}
         self.metrics = {
             "level": self.level,
-            "coordination_mode": "centralized_coordinator" if self.level == 6 else "decentralized_no_communication",
+            "coordination_mode": "centralized_coordinator" if self.level in {6, 9} else "decentralized_no_communication",
             "reward_mode": self.reward_mode,
             "hotspots": list(HOTSPOTS),
             "total_events_spawned": 0,
@@ -287,10 +297,17 @@ class DisasterSurveillanceEnvironment(
                 "detection_reward": 0.0,
                 "miss_penalty": 0.0,
                 "growth_penalty": 0.0,
+                "false_report_penalty": 0.0,
                 "overlap_penalty": 0.0,
                 "coverage_reward": 0.0,
                 "episode_bonus": 0.0,
             },
+            "false_reports_issued": 0,
+            "false_reports_active": 0,
+            "false_report_targets_assigned": 0,
+            "false_report_investigations": 0,
+            "false_report_rejection_rate": 0.0,
+            "total_false_report_penalty": 0.0,
             "last_assigned_targets": {},
             "target_assignment_count": 0,
             "target_progress_sum": 0.0,
@@ -306,10 +323,12 @@ class DisasterSurveillanceEnvironment(
             "last_llm_raw_response": None,
             "last_llm_debug": None,
             "_latencies_by_severity": latency_lists,
+            "_investigated_false_report_ids": set(),
         }
         self._mark_initial_cells_visited()
         self._sync_coverage_metrics()
         self._sync_priority_metrics()
+        self._sync_false_report_metrics()
         self._last_reward = 0.0
         return self._build_current_observation(reward=0.0, done=False)
 
@@ -327,7 +346,10 @@ class DisasterSurveillanceEnvironment(
         processed_timestep = self.timestep
         self._spawn_step_event()
 
-        if self.level == 6:
+        if self.level == 9:
+            self._update_adversarial_reports()
+
+        if self.level in {6, 9}:
             coordinator_observation = self.build_coordinator_observation()
             assigned_targets = self._resolve_coordinator_targets(action, coordinator_observation)
             self._apply_coordinator_targets(assigned_targets)
@@ -391,6 +413,10 @@ class DisasterSurveillanceEnvironment(
             x, y = target
             if grid[y][x] == ".":
                 grid[y][x] = "T"
+        for report in self.reported_events:
+            x, y = tuple(report["location"])
+            if self._valid_cell(x, y) and grid[y][x] == ".":
+                grid[y][x] = "?"
         for index, drone in enumerate(self.drones.values(), start=1):
             x, y = drone.position
             grid[y][x] = str(index)
@@ -414,6 +440,21 @@ class DisasterSurveillanceEnvironment(
             for event in self.events
             if event.is_active(self.timestep) and event.location in visible_cells and not event.detected
         ]
+        reported_events = [
+            {
+                "id": report["id"],
+                "location": tuple(report["location"]),
+                "severity": report["severity"],
+                "type": report["type"],
+                "type_priority": int(report["type_priority"]),
+                "severity_score": float(report["severity_score"]),
+                "credibility": float(report["credibility"]),
+                "reported_at": int(report["reported_at"]),
+                "expires_at": int(report["expires_at"]),
+                "time_remaining": int(report["expires_at"]) - self.timestep,
+            }
+            for report in self.reported_events
+        ]
         known_detected_events = sorted(
             {
                 (
@@ -432,6 +473,7 @@ class DisasterSurveillanceEnvironment(
             "grid_size": self.grid_size,
             "drone_positions": {drone_id: drone.position for drone_id, drone in self.drones.items()},
             "visible_active_events": visible_active_events,
+            "reported_events": reported_events,
             "known_detected_events": [
                 {
                     "id": event_id,
@@ -447,6 +489,93 @@ class DisasterSurveillanceEnvironment(
         }
         self.last_coordinator_observation = observation
         return observation
+
+    def _update_adversarial_reports(self) -> None:
+        if self.level != 9:
+            return
+
+        self.reported_events = [
+            report for report in self.reported_events if int(report["expires_at"]) > self.timestep
+        ]
+        self._sync_false_report_metrics()
+        if len(self.reported_events) >= self.FALSE_REPORT_MAX_ACTIVE:
+            return
+
+        active_events = [event for event in self.events if event.is_active(self.timestep) and not event.detected]
+        high_priority_pressure = any(event_type_priority(event.type) >= 6 for event in active_events)
+        spawn_probability = 0.12 + (0.12 if high_priority_pressure else 0.0)
+        if self.rng.random() >= min(0.35, spawn_probability):
+            return
+
+        report = self._spawn_false_report(active_events)
+        if report is None:
+            return
+
+        self.reported_events.append(report)
+        self.next_report_id += 1
+        self.metrics["false_reports_issued"] += 1
+        self._sync_false_report_metrics()
+
+    def _spawn_false_report(self, active_events: Sequence[Event]) -> Dict[str, Any] | None:
+        occupied_locations = {
+            event.location
+            for event in self.events
+            if event.is_active(self.timestep) and not event.detected
+        }
+        occupied_locations.update(tuple(report["location"]) for report in self.reported_events)
+
+        candidate_location: Coord | None = None
+        best_distance = -1
+        for _ in range(20):
+            candidate = (
+                int(self.rng.integers(0, self.grid_size)),
+                int(self.rng.integers(0, self.grid_size)),
+            )
+            if candidate in occupied_locations:
+                continue
+            distance_to_real = min(
+                (manhattan_distance(candidate, event.location) for event in active_events),
+                default=self.grid_size,
+            )
+            if distance_to_real > best_distance:
+                candidate_location = candidate
+                best_distance = distance_to_real
+        if candidate_location is None:
+            return None
+
+        report_type = str(self.rng.choice(["riot", "fire", "gas_leak", "flood_zone"]))
+        severity_score = float(
+            {
+                "flood_zone": self.rng.uniform(2.0, 2.6),
+                "fire": self.rng.uniform(2.1, 2.9),
+                "riot": self.rng.uniform(2.4, 3.0),
+                "gas_leak": self.rng.uniform(2.8, 3.4),
+            }[report_type]
+        )
+        return {
+            "id": f"report_{self.next_report_id}",
+            "location": candidate_location,
+            "severity": severity_label_from_score(severity_score),
+            "type": report_type,
+            "type_priority": event_type_priority(report_type),
+            "severity_score": severity_score,
+            "credibility": float(self.rng.uniform(0.35, 0.8)),
+            "reported_at": self.timestep,
+            "expires_at": self.timestep + self.FALSE_REPORT_MEMORY_LIMIT,
+            "source": "scripted_adversary",
+        }
+
+    def _sync_false_report_metrics(self) -> None:
+        self.metrics["false_reports_active"] = len(self.reported_events)
+        false_reports_issued = int(self.metrics.get("false_reports_issued", 0))
+        investigated_report_ids = self.metrics.get("_investigated_false_report_ids", set())
+        investigated_count = len(investigated_report_ids) if isinstance(investigated_report_ids, set) else len(set(investigated_report_ids))
+        self.metrics["false_report_investigations"] = investigated_count
+        self.metrics["false_report_rejection_rate"] = (
+            max(0.0, (false_reports_issued - investigated_count) / float(false_reports_issued))
+            if false_reports_issued
+            else 0.0
+        )
 
     def _compute_fovs(self) -> Dict[str, set[Coord]]:
         return {
@@ -761,7 +890,7 @@ class DisasterSurveillanceEnvironment(
                     "model_name": getattr(self.coordinator, "model_name", None),
                 }
             elif action.actions is not None:
-                raise ValueError("Level 6 does not accept direct per-drone movement actions.")
+                raise ValueError("Coordinator-controlled level does not accept direct per-drone movement actions.")
             else:
                 decision = self.coordinator.decide(coordinator_observation) if hasattr(self.coordinator, "decide") else None
                 targets = decision.targets if decision is not None else self.coordinator.act(coordinator_observation)
@@ -779,7 +908,7 @@ class DisasterSurveillanceEnvironment(
                     "model_name": getattr(self.coordinator, "model_name", None),
                 }
             else:
-                raise ValueError("Level 6 expects coordinator targets, not direct movement actions.")
+                raise ValueError("Coordinator-controlled levels expect coordinator targets, not direct movement actions.")
         else:
             targets = normalize_targets(action, self.agent_ids, self.grid_size)
             decision_metadata = {
@@ -845,7 +974,7 @@ class DisasterSurveillanceEnvironment(
                 reward_per_new_cell=self.coverage_reward_per_new_cell,
             )
 
-        return compute_level5_reward(
+        reward, reward_info = compute_level5_reward(
             detected_events=detected_events,
             missed_events=missed_events,
             fovs=fovs,
@@ -853,6 +982,63 @@ class DisasterSurveillanceEnvironment(
             reward_per_new_cell=self.coverage_reward_per_new_cell,
             active_undetected_events=[event for event in self.events if event.is_active(self.timestep) and not event.detected],
         )
+        if self.level != 9:
+            reward_info["false_report_penalty"] = 0.0
+            reward_info["false_report_targets"] = 0
+            reward_info["matched_false_reports"] = []
+            reward_info["reward_breakdown"]["false_report_penalty"] = 0.0
+            return reward, reward_info
+
+        false_report_penalty, false_report_info = self._compute_false_report_penalty()
+        reward += false_report_penalty
+        reward_info["false_report_penalty"] = false_report_penalty
+        reward_info["false_report_targets"] = false_report_info["false_report_targets"]
+        reward_info["matched_false_reports"] = false_report_info["matched_false_reports"]
+        reward_info["reward_breakdown"]["false_report_penalty"] = false_report_penalty
+        return reward, reward_info
+
+    def _compute_false_report_penalty(self) -> tuple[float, Dict[str, Any]]:
+        if self.level != 9 or not self.last_assigned_targets or not self.reported_events:
+            return 0.0, {"false_report_targets": 0, "matched_false_reports": []}
+
+        active_real_locations = {
+            event.location
+            for event in self.events
+            if event.is_active(self.timestep) and not event.detected
+        }
+        reports_by_location = {
+            tuple(report["location"]): report
+            for report in self.reported_events
+        }
+        matched_reports: list[Dict[str, Any]] = []
+        penalty = 0.0
+        for drone_id, target in self.last_assigned_targets.items():
+            report = None
+            for location, candidate in reports_by_location.items():
+                dx = int(target[0]) - int(location[0])
+                dy = int(target[1]) - int(location[1])
+                if dx * dx + dy * dy > self.fov_radius * self.fov_radius:
+                    continue
+                if location in active_real_locations:
+                    continue
+                report = candidate
+                break
+            if report is None:
+                continue
+            matched_reports.append(
+                {
+                    "drone_id": drone_id,
+                    "report_id": report["id"],
+                    "location": tuple(target),
+                    "credibility": float(report["credibility"]),
+                    "type": report["type"],
+                }
+            )
+            penalty -= 1.0 + 0.5 * float(report["credibility"]) + 0.1 * float(report["type_priority"])
+        return penalty, {
+            "false_report_targets": len(matched_reports),
+            "matched_false_reports": matched_reports,
+        }
 
     def _apply_reward_metrics(self, reward_info: Mapping[str, Any]) -> None:
         self.visited_cells.update(reward_info["new_cells"])
@@ -861,6 +1047,11 @@ class DisasterSurveillanceEnvironment(
         self.metrics["total_detection_reward"] += reward_info["detection_reward"]
         self.metrics["total_miss_penalty"] += reward_info["miss_penalty"]
         self.metrics["total_growth_penalty"] += reward_info.get("growth_penalty", 0.0)
+        self.metrics["total_false_report_penalty"] += reward_info.get("false_report_penalty", 0.0)
+        self.metrics["false_report_targets_assigned"] += int(reward_info.get("false_report_targets", 0))
+        investigated_false_report_ids = self.metrics.setdefault("_investigated_false_report_ids", set())
+        for report in reward_info.get("matched_false_reports", []):
+            investigated_false_report_ids.add(str(report["report_id"]))
         for key, value in reward_info["reward_breakdown"].items():
             if key == "episode_bonus":
                 continue
@@ -868,6 +1059,7 @@ class DisasterSurveillanceEnvironment(
             self.metrics["reward_breakdown"][key] += float(value)
         self._sync_coverage_metrics()
         self._sync_priority_metrics()
+        self._sync_false_report_metrics()
 
     def _sync_coverage_metrics(self) -> None:
         self.metrics["unique_cells_visited"] = len(self.visited_cells)
@@ -1047,7 +1239,7 @@ def run_random_episode(
 
     while not observation.done:
         action: DroneActions | Dict[str, Any]
-        if level == 6:
+        if level in {6, 9}:
             coordinator_observation = env.build_coordinator_observation()
             action = None
             if render:
@@ -1071,7 +1263,7 @@ def run_random_episode(
             print(f"{key}: {value}")
         _print_severity_metrics(public_metrics)
         _print_reward_breakdown(public_metrics)
-        if level == 6:
+        if level in {6, 9}:
             print("Coordinator summary:")
             print(f"  coordinator_backend: {public_metrics['coordinator_backend']}")
             print(f"  coordinator_model_name: {public_metrics['coordinator_model_name']}")
@@ -1147,9 +1339,9 @@ def main() -> None:
     parser.add_argument(
         "--level",
         type=int,
-        choices=[3, 4, 5, 6],
+        choices=[3, 4, 5, 6, 9],
         default=4,
-        help="Environment level: 3 baseline, 4 shaped coordination, 5 urgency, or 6 coordinator control.",
+        help="Environment level: 3 baseline, 4 shaped coordination, 5 urgency, 6 coordinator control, or 9 adversarial false-positive reports.",
     )
     parser.add_argument("--episodes", "-k", type=int, default=1, help="Number of episodes to run.")
     parser.add_argument("--episode-length", type=int, default=None, help="Override episode length for debugging.")

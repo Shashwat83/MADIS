@@ -44,3 +44,28 @@ def test_json_valid_reward_marks_valid_and_invalid_completions() -> None:
     )
 
     assert rewards == [1.0, -1.0]
+
+
+def test_snapshot_and_restore_preserve_level9_reported_events() -> None:
+    env = DisasterSurveillanceEnvironment(level=9, seed=14, p_spawn=0.0)
+    env.reset(seed=14)
+    env.reported_events = [
+        {
+            "id": "report_1",
+            "location": (7, 7),
+            "severity": "HIGH",
+            "type": "gas_leak",
+            "type_priority": 7,
+            "severity_score": 3.1,
+            "credibility": 0.6,
+            "reported_at": 0,
+            "expires_at": 8,
+            "source": "scripted_adversary",
+        }
+    ]
+
+    snapshot = snapshot_environment(env)
+    restored = restore_environment(snapshot)
+
+    assert restored.level == 9
+    assert restored.reported_events == env.reported_events
