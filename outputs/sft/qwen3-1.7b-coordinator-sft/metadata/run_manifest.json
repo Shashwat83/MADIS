@@ -1,0 +1,41 @@
+{
+  "artifact_type": "peft_lora",
+  "base_model_name": "Qwen/Qwen3-1.7B",
+  "dataset_manifest": {
+    "eval_jsonl": "/content/heuristic_eval.jsonl",
+    "eval_records": 100,
+    "eval_sha256": "e11d5ca7ffab8fb3429f4600893f49a04c064d5f382f0e870f2a080400983f30",
+    "train_jsonl": "/content/heuristic_train.jsonl",
+    "train_records": 400,
+    "train_sha256": "2870c18f56fb5bdcd12fd18070ae4e38d5ac5f25d422daabc6b16475eaee09da"
+  },
+  "grpo_reuse": {
+    "adapter_subdir": "adapter",
+    "load_with_base_model": "Qwen/Qwen3-1.7B",
+    "prompt_parser_contract": "targets",
+    "recommended_start_model_type": "peft_adapter",
+    "tokenizer_subdir": "tokenizer"
+  },
+  "max_seq_length": 768,
+  "output_mode": "targets",
+  "training_args": {
+    "eval_steps": 50,
+    "gradient_accumulation_steps": 16,
+    "gradient_checkpointing": true,
+    "learning_rate": 0.0002,
+    "logging_steps": 10,
+    "lora_alpha": 32,
+    "lora_dropout": 0.05,
+    "lora_r": 16,
+    "lora_target_modules": "q_proj,k_proj,v_proj,o_proj,gate_proj,up_proj,down_proj",
+    "max_steps": -1,
+    "num_train_epochs": 1.0,
+    "per_device_eval_batch_size": 1,
+    "per_device_train_batch_size": 1,
+    "save_steps": 50,
+    "seed": 42,
+    "use_4bit": false,
+    "warmup_ratio": 0.03,
+    "weight_decay": 0.0
+  }
+}

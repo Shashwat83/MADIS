@@ -1,0 +1,84 @@
+{
+  "run_name": "qwen3-1.7b-coordinator-sft",
+  "artifact_root": "/Users/divyanshukumar21/Desktop/MADIS/outputs/sft/qwen3-1.7b-coordinator-sft",
+  "base_model_name": "Qwen/Qwen3-1.7B",
+  "training_stage": "sft",
+  "status": "completed",
+  "output_mode": "targets",
+  "dataset_summary": {
+    "train_records": 400,
+    "eval_records": 100,
+    "train_jsonl_origin": "/content/heuristic_train.jsonl",
+    "eval_jsonl_origin": "/content/heuristic_eval.jsonl",
+    "dataset_type": "heuristic_imitation"
+  },
+  "hyperparameters": {
+    "max_seq_length": 768,
+    "per_device_train_batch_size": 1,
+    "per_device_eval_batch_size": 1,
+    "gradient_accumulation_steps": 16,
+    "learning_rate": 0.0002,
+    "num_train_epochs": 1.0,
+    "max_steps": 25,
+    "weight_decay": 0.0,
+    "warmup_ratio": 0.03,
+    "logging_steps": 10,
+    "save_steps": 50,
+    "eval_steps": 50,
+    "seed": 42,
+    "gradient_checkpointing": true,
+    "use_4bit": false,
+    "lora_r": 16,
+    "lora_alpha": 32,
+    "lora_dropout": 0.05,
+    "lora_target_modules": [
+      "q_proj",
+      "k_proj",
+      "v_proj",
+      "o_proj",
+      "gate_proj",
+      "up_proj",
+      "down_proj"
+    ]
+  },
+  "training_results": {
+    "global_step": 25,
+    "train_batch_size": 1,
+    "final_train_loss": 0.22981079331599175,
+    "logged_train_losses": [
+      {
+        "step": 10,
+        "epoch": 0.4,
+        "loss": 0.5565391063690186,
+        "grad_norm": 0.4248184263706207,
+        "learning_rate": 0.00013333333333333334
+      },
+      {
+        "step": 20,
+        "epoch": 0.8,
+        "loss": 0.017708085477352142,
+        "grad_norm": 0.05006176605820656,
+        "learning_rate": 5e-05
+      }
+    ],
+    "eval_ran_during_training": false,
+    "best_metric": null,
+    "best_model_checkpoint": null,
+    "train_runtime_seconds": 619.9887,
+    "train_samples_per_second": 0.645,
+    "train_steps_per_second": 0.04,
+    "total_flos": 1643105387630592.0
+  },
+  "artifacts": {
+    "adapter_path": "/Users/divyanshukumar21/Desktop/MADIS/outputs/sft/qwen3-1.7b-coordinator-sft/adapter",
+    "tokenizer_path": "/Users/divyanshukumar21/Desktop/MADIS/outputs/sft/qwen3-1.7b-coordinator-sft/tokenizer",
+    "checkpoint_path": "/Users/divyanshukumar21/Desktop/MADIS/outputs/sft/qwen3-1.7b-coordinator-sft/checkpoints/checkpoint-25",
+    "run_manifest_path": "/Users/divyanshukumar21/Desktop/MADIS/outputs/sft/qwen3-1.7b-coordinator-sft/metadata/run_manifest.json",
+    "grpo_reuse_path": "/Users/divyanshukumar21/Desktop/MADIS/outputs/sft/qwen3-1.7b-coordinator-sft/metadata/grpo_reuse.json"
+  },
+  "notes": [
+    "This run completed successfully in Colab and was imported into the local repository.",
+    "Evaluation did not run during training because eval_steps=50 while training finished at global_step=25.",
+    "This artifact is intended to be the starting point for the next GRPO stage."
+  ]
+}

@@ -1,0 +1,9 @@
+{
+  "adapter_path": "/Users/divyanshukumar21/Desktop/MADIS/outputs/sft/qwen3-1.7b-coordinator-sft/adapter",
+  "adapter_subdir": "adapter",
+  "load_with_base_model": "Qwen/Qwen3-1.7B",
+  "prompt_parser_contract": "targets",
+  "recommended_start_model_type": "peft_adapter",
+  "tokenizer_path": "/Users/divyanshukumar21/Desktop/MADIS/outputs/sft/qwen3-1.7b-coordinator-sft/tokenizer",
+  "tokenizer_subdir": "tokenizer"
+}

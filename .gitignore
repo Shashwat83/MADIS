@@ -13,3 +13,6 @@ outputs/evals/*
 outputs/matplotlib_cache/
 !outputs/logs/.gitkeep
 !outputs/evals/.gitkeep
+outputs/sft/*/adapter/
+outputs/sft/*/checkpoints/
+outputs/sft/*/tokenizer/
