@@ -50,7 +50,7 @@ Run the local random rollout:
 python3 scripts/run_random_episode.py --level 6 --episodes 1
 ```
 
-Level 6 uses the coordinator model `Qwen/Qwen3-1.7B` by default through Hugging Face inference when available. If inference is unavailable locally, the env falls back to the heuristic coordinator and logs that fallback in metrics.
+Level 6 uses the coordinator model `deepseek-ai/DeepSeek-R1-Distill-Qwen-1.5B` by default through the Hugging Face OpenAI-compatible router when available. If inference is unavailable, the env falls back to the heuristic coordinator and logs that fallback in metrics.
 
 Run the Level 3 baseline:
 
@@ -70,14 +70,14 @@ Run the 400-episode baseline analysis and cache CSV/SVG plot data:
 python3 scripts/analyze_baseline.py --episodes 400
 ```
 
-Train the local Qwen coordinator with optional SFT warmup and GRPO on Colab:
+Train the local DeepSeek-distilled coordinator with optional SFT warmup and GRPO on Colab:
 
 ```bash
 pip install -U "transformers>=4.45.0" "trl>=0.14.0" peft accelerate bitsandbytes datasets
 pip install -e ".[llm]"
 python3 scripts/train_grpo_coordinator.py \
-  --model Qwen/Qwen3-1.7B \
-  --output-dir outputs/qwen3_grpo_coordinator \
+  --model deepseek-ai/DeepSeek-R1-Distill-Qwen-1.5B \
+  --output-dir outputs/deepseek_grpo_coordinator \
   --num-prompts 1024 \
   --episode-length 10 \
   --sft-steps 100 \
@@ -85,12 +85,22 @@ python3 scripts/train_grpo_coordinator.py \
   --num-generations 2
 ```
 
-Evaluate the trained LoRA coordinator locally:
+Evaluate with the hosted Hugging Face API:
+
+```bash
+export HF_TOKEN=your_hugging_face_token
+export HF_COORDINATOR_MODEL=deepseek-ai/DeepSeek-R1-Distill-Qwen-1.5B
+unset USE_LOCAL_QWEN
+unset LOCAL_QWEN_ADAPTER_PATH
+python3 scripts/analyze_baseline.py --level 6 --episodes 400
+```
+
+Evaluate a trained LoRA coordinator locally:
 
 ```bash
 export USE_LOCAL_QWEN=true
-export HF_COORDINATOR_MODEL=Qwen/Qwen3-1.7B
-export LOCAL_QWEN_ADAPTER_PATH=outputs/qwen3_grpo_coordinator/grpo_lora
+export HF_COORDINATOR_MODEL=deepseek-ai/DeepSeek-R1-Distill-Qwen-1.5B
+export LOCAL_QWEN_ADAPTER_PATH=outputs/deepseek_grpo_coordinator/grpo_lora
 python3 scripts/analyze_baseline.py --level 6 --episodes 400
 ```
 

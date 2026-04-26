@@ -21,7 +21,7 @@ except Exception:  # pragma: no cover
 
 
 DEFAULT_ROUTER_BASE_URL = "https://router.huggingface.co/v1"
-DEFAULT_REMOTE_LLM = "Qwen/Qwen3-1.7B"
+DEFAULT_REMOTE_LLM = "deepseek-ai/DeepSeek-R1-Distill-Qwen-1.5B"
 
 
 def get_configured_model_name(explicit_model_name: Optional[str] = None) -> str:

@@ -59,7 +59,7 @@ def run_analysis_episode(seed: int, level: int = 6, episode_length: int | None =
     fallback_count = int(metrics.get("coordinator_fallback_count", 0))
     metrics["derived_fallback_rate"] = fallback_count / float(target_assignments or 1)
     metrics["model_name"] = metrics.get("coordinator_model_name") or get_configured_model_name()
-    metrics["policy_type"] = "qwen_llm_coordinator" if level == 6 else "baseline_random"
+    metrics["policy_type"] = "hosted_llm_coordinator" if level == 6 else "baseline_random"
     return metrics
 
 
@@ -530,7 +530,7 @@ def save_outputs(metrics: Sequence[Mapping[str, Any]], output_dir: Path) -> None
 
 def default_output_dir(level: int, episodes: int) -> Path:
     if level == 6:
-        return ROOT / "outputs" / "evals" / f"qwen3_1_7b_level6_{episodes}"
+        return ROOT / "outputs" / "evals" / f"deepseek_r1_distill_qwen_1_5b_level6_{episodes}"
     return ROOT / "outputs" / "evals" / f"baseline_level{level}_{episodes}"
 
 

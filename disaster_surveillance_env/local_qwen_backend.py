@@ -9,7 +9,11 @@ from transformers import AutoModelForCausalLM, AutoTokenizer
 class LocalQwenBackend:
     """Local Qwen text-generation backend compatible with LLMCoordinator."""
 
-    def __init__(self, model_name: str = "Qwen/Qwen3-1.7B", adapter_path: str | None = None) -> None:
+    def __init__(
+        self,
+        model_name: str = "deepseek-ai/DeepSeek-R1-Distill-Qwen-1.5B",
+        adapter_path: str | None = None,
+    ) -> None:
         self.model_name = model_name
         self.adapter_path = adapter_path or os.environ.get("LOCAL_QWEN_ADAPTER_PATH")
         if self.adapter_path and not os.path.exists(self.adapter_path):

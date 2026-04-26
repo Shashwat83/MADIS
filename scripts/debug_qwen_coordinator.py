@@ -13,7 +13,7 @@ from disaster_surveillance_env.coordinator import DEFAULT_REMOTE_LLM, LLMCoordin
 
 
 def main() -> None:
-    print("Qwen coordinator environment check:")
+    print("Hosted coordinator environment check:")
     print(f"  DEFAULT_REMOTE_LLM: {DEFAULT_REMOTE_LLM}")
     print(f"  HF_COORDINATOR_MODEL: {os.environ.get('HF_COORDINATOR_MODEL')}")
     print(f"  MODEL_NAME: {os.environ.get('MODEL_NAME')}")
@@ -42,10 +42,7 @@ def main() -> None:
         "recent_team_coverage_ratio": 0.34,
         "known_detected_events": [],
     }
-    from disaster_surveillance_env.local_qwen_backend import LocalQwenBackend
-    coordinator = LLMCoordinator(
-      backend=LocalQwenBackend("Qwen/Qwen3-1.7B")
-)
+    coordinator = LLMCoordinator()
     decision = coordinator.decide(observation)
     print("targets:", decision.targets)
     print("metadata:")

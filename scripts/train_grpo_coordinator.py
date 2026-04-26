@@ -483,8 +483,12 @@ def run_grpo(
 
 def main() -> None:
     parser = argparse.ArgumentParser(description="Train the Level 6 coordinator LLM with optional SFT warmup and GRPO.")
-    parser.add_argument("--model", default="Qwen/Qwen3-1.7B", help="Local Hugging Face model id.")
-    parser.add_argument("--output-dir", type=Path, default=ROOT / "outputs" / "qwen3_grpo_coordinator")
+    parser.add_argument(
+        "--model",
+        default="deepseek-ai/DeepSeek-R1-Distill-Qwen-1.5B",
+        help="Local Hugging Face model id.",
+    )
+    parser.add_argument("--output-dir", type=Path, default=ROOT / "outputs" / "deepseek_grpo_coordinator")
     parser.add_argument("--num-prompts", type=int, default=1024, help="Prompt states cached before training.")
     parser.add_argument("--episode-length", type=int, default=10, help="Short horizon used for prompt collection.")
     parser.add_argument("--rollout-steps-per-episode", type=int, default=5)
