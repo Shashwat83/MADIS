@@ -173,6 +173,7 @@ def _make_callback(
     eval_output_dir: Path,
     effective_prompt_batch: int,
     log_every_episodes: int,
+    plot_every_steps: int,
     small_eval_every_episodes: int,
     small_eval_episodes: int,
     medium_eval_every_episodes: int,
@@ -215,7 +216,7 @@ def _make_callback(
                 list(row.keys()),
                 row,
             )
-            _save_training_plots(self.training_csv, eval_output_dir)
+            should_refresh_plots = bool(plot_every_steps) and step % max(1, plot_every_steps) == 0
 
             while episodes_seen >= self.next_log_episode:
                 print(
@@ -232,6 +233,7 @@ def _make_callback(
             backend = LoadedPeftCoordinatorBackend(model=model, tokenizer=processing_class or tokenizer, torch_module=torch_module)
             triggered, self.next_small_eval = _consume_eval_trigger(episodes_seen, self.next_small_eval, small_eval_every_episodes)
             if triggered is not None:
+                should_refresh_plots = True
                 self._run_eval(
                     eval_type="small",
                     eval_episodes=small_eval_episodes,
@@ -241,6 +243,7 @@ def _make_callback(
                 )
             triggered, self.next_medium_eval = _consume_eval_trigger(episodes_seen, self.next_medium_eval, medium_eval_every_episodes)
             if triggered is not None:
+                should_refresh_plots = True
                 self._run_eval(
                     eval_type="medium",
                     eval_episodes=medium_eval_episodes,
@@ -250,6 +253,7 @@ def _make_callback(
                 )
             triggered, self.next_full_eval = _consume_eval_trigger(episodes_seen, self.next_full_eval, full_eval_every_episodes)
             if triggered is not None:
+                should_refresh_plots = True
                 self._run_eval(
                     eval_type="full",
                     eval_episodes=full_eval_episodes,
@@ -257,6 +261,8 @@ def _make_callback(
                     backend=backend,
                     step=step,
                 )
+            if should_refresh_plots:
+                _save_training_plots(self.training_csv, eval_output_dir)
 
         def _run_eval(self, *, eval_type: str, eval_episodes: int, trigger_episodes: int, backend: object, step: int) -> None:
             output_dir = eval_output_dir / f"{eval_type}_eval_ep{trigger_episodes:04d}"
@@ -321,20 +327,46 @@ def main() -> None:
     parser.add_argument("--max-prompt-length", type=int, default=1024)
     parser.add_argument("--max-completion-length", type=int, default=128)
     parser.add_argument("--logging-episodes", type=int, default=None)
+    parser.add_argument("--logging-steps", type=int, default=10, help="TRL logging interval in trainer steps.")
+    parser.add_argument(
+        "--plot-every-steps",
+        type=int,
+        default=25,
+        help="Regenerate training SVG plots every N trainer steps. Set to 0 to disable periodic plot refresh.",
+    )
     parser.add_argument("--small-eval-every-episodes", type=int, default=None)
     parser.add_argument("--small-eval-episodes", type=int, default=None)
     parser.add_argument("--medium-eval-every-episodes", type=int, default=None)
     parser.add_argument("--medium-eval-episodes", type=int, default=None)
     parser.add_argument("--full-eval-every-episodes", type=int, default=None)
     parser.add_argument("--full-eval-episodes", type=int, default=None)
-    parser.add_argument("--save-steps", type=int, default=50)
+    parser.add_argument(
+        "--save-steps",
+        type=int,
+        default=None,
+        help="Checkpoint save interval in trainer steps. If omitted, it is set to --save-every-pct of max_steps.",
+    )
+    parser.add_argument(
+        "--save-every-pct",
+        type=int,
+        default=10,
+        help="When --save-steps is omitted, save a checkpoint every N percent of training progress.",
+    )
     parser.add_argument("--seed", type=int, default=42)
     parser.add_argument("--eval-seed", type=int, default=1000)
     parser.add_argument("--gradient-checkpointing", action="store_true", default=True)
+    parser.add_argument("--no-gradient-checkpointing", dest="gradient_checkpointing", action="store_false")
     parser.add_argument("--use-4bit", action="store_true")
     parser.add_argument("--bf16", action="store_true")
     parser.add_argument("--fp16", action="store_true")
     parser.add_argument("--use-vllm", action="store_true", help="Enable vLLM generation if your TRL install supports it.")
+    parser.add_argument("--log-completions", action="store_true", help="Enable TRL completion logging (can be slow).")
+    parser.add_argument(
+        "--attn-implementation",
+        type=str,
+        default=None,
+        help='Optional attention backend to request from transformers, e.g. "flash_attention_2" or "sdpa".',
+    )
     parser.add_argument("--trust-remote-code", action="store_true")
     parser.add_argument("--dry-run", action="store_true")
     args = parser.parse_args()
@@ -359,9 +391,14 @@ def main() -> None:
     args.output_dir.mkdir(parents=True, exist_ok=True)
     args.eval_output_dir.mkdir(parents=True, exist_ok=True)
     train_prompts_jsonl = args.train_prompts_jsonl or (args.output_dir / "data" / "train_prompts.jsonl")
-    eval_prompts_jsonl = args.eval_prompts_jsonl or (args.output_dir / "data" / "eval_prompts.jsonl")
     _ensure_prompt_dataset(train_prompts_jsonl, episodes=training_episodes, seed=args.seed, episode_length=episode_length)
-    _ensure_prompt_dataset(eval_prompts_jsonl, episodes=full_eval_episodes, seed=args.eval_seed, episode_length=episode_length)
+    if args.eval_prompts_jsonl is not None:
+        _ensure_prompt_dataset(
+            args.eval_prompts_jsonl,
+            episodes=full_eval_episodes,
+            seed=args.eval_seed,
+            episode_length=episode_length,
+        )
 
     sft_info = _load_sft_artifact_info(args.sft_run_dir)
     grpo_reuse = sft_info["grpo_reuse"]
@@ -396,6 +433,8 @@ def main() -> None:
     if args.dry_run:
         print("GRPO dry run configuration validated.")
         print(f"Train prompt dataset: {train_prompts_jsonl}")
+        if args.eval_prompts_jsonl is not None:
+            print(f"Eval prompt dataset: {args.eval_prompts_jsonl}")
         print(f"Eval output dir: {args.eval_output_dir}")
         return
 
@@ -420,6 +459,8 @@ def main() -> None:
 
     model_kwargs: Dict[str, Any] = {"trust_remote_code": args.trust_remote_code}
     model_kwargs.update(from_pretrained_token_kwargs())
+    if args.attn_implementation is not None:
+        model_kwargs["attn_implementation"] = args.attn_implementation
     if args.use_4bit:
         compute_dtype = torch.bfloat16 if args.bf16 else (torch.float16 if args.fp16 else torch.float32)
         model_kwargs["quantization_config"] = BitsAndBytesConfig(
@@ -447,6 +488,11 @@ def main() -> None:
 
     effective_prompt_batch = prompts_per_update
     max_steps = max(1, training_episodes // max(1, effective_prompt_batch))
+    if args.save_steps is None:
+        pct = max(1, min(100, int(args.save_every_pct)))
+        save_steps = max(1, int(round(max_steps * (pct / 100.0))))
+    else:
+        save_steps = max(1, int(args.save_steps))
     callback_cls = _make_callback(
         torch_module=torch,
         tokenizer=tokenizer,
@@ -454,6 +500,7 @@ def main() -> None:
         eval_output_dir=args.eval_output_dir,
         effective_prompt_batch=effective_prompt_batch,
         log_every_episodes=log_every_episodes,
+        plot_every_steps=args.plot_every_steps,
         small_eval_every_episodes=small_eval_every,
         small_eval_episodes=small_eval_episodes,
         medium_eval_every_episodes=medium_eval_every,
@@ -476,15 +523,15 @@ def main() -> None:
             "per_device_train_batch_size": prompts_per_update,
             "max_prompt_length": args.max_prompt_length,
             "max_completion_length": args.max_completion_length,
-            "logging_steps": 1,
-            "save_steps": args.save_steps,
+            "logging_steps": args.logging_steps,
+            "save_steps": save_steps,
             "max_steps": max_steps,
             "bf16": args.bf16,
             "fp16": args.fp16,
             "gradient_checkpointing": args.gradient_checkpointing,
             "report_to": [],
             "seed": args.seed,
-            "log_completions": True,
+            "log_completions": args.log_completions,
             "use_vllm": args.use_vllm,
         },
     )

@@ -17,8 +17,16 @@ class ParsedCompletion:
     unique_target_ratio: float
 
 
-def parse_or_fallback_completion(completion: str, snapshot_json: str) -> ParsedCompletion:
-    snapshot = json.loads(snapshot_json)
+def parse_or_fallback_completion(
+    completion: str,
+    snapshot_json: str | None = None,
+    *,
+    snapshot: Mapping[str, Any] | None = None,
+) -> ParsedCompletion:
+    if snapshot is None:
+        if snapshot_json is None:
+            raise ValueError("Either snapshot_json or snapshot must be provided.")
+        snapshot = json.loads(snapshot_json)
     drone_ids = [drone["id"] for drone in snapshot["drones"]]
     grid_size = int(snapshot.get("grid_size", 10))
     default_targets = {
@@ -44,17 +52,19 @@ def parse_or_fallback_completion(completion: str, snapshot_json: str) -> ParsedC
 
 
 def json_valid_reward(completions: Sequence[str], snapshot_json: Sequence[str], **kwargs: Any) -> List[float]:
-    return [
-        1.0 if parse_or_fallback_completion(completion, snapshot).parse_success else -1.0
-        for completion, snapshot in zip(completions, snapshot_json)
-    ]
+    rewards: List[float] = []
+    for completion, snapshot_text in zip(completions, snapshot_json):
+        snapshot = json.loads(snapshot_text)
+        rewards.append(1.0 if parse_or_fallback_completion(completion, snapshot=snapshot).parse_success else -1.0)
+    return rewards
 
 
 def unique_target_reward(completions: Sequence[str], snapshot_json: Sequence[str], **kwargs: Any) -> List[float]:
-    return [
-        parse_or_fallback_completion(completion, snapshot).unique_target_ratio
-        for completion, snapshot in zip(completions, snapshot_json)
-    ]
+    ratios: List[float] = []
+    for completion, snapshot_text in zip(completions, snapshot_json):
+        snapshot = json.loads(snapshot_text)
+        ratios.append(parse_or_fallback_completion(completion, snapshot=snapshot).unique_target_ratio)
+    return ratios
 
 
 def environment_step_reward(
@@ -65,7 +75,7 @@ def environment_step_reward(
     rewards: List[float] = []
     for completion, snapshot_text in zip(completions, snapshot_json):
         snapshot = json.loads(snapshot_text)
-        parsed = parse_or_fallback_completion(completion, snapshot_text)
+        parsed = parse_or_fallback_completion(completion, snapshot=snapshot)
         env = restore_environment(
             snapshot,
         )
