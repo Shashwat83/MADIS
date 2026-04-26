@@ -18,6 +18,7 @@ from ..models import (
     DroneActions,
     Event,
     HOTSPOTS,
+    EVENT_TYPES,
     SEVERITY_CONFIG,
     build_observation,
     build_team_metrics,
@@ -26,10 +27,12 @@ from ..models import (
     compute_grid_coverage,
     compute_level5_reward,
     compute_reward,
+    event_type_priority,
     get_fov_cells,
     manhattan_distance,
     normalize_actions,
     normalize_targets,
+    severity_label_from_score,
     spawn_event,
 )
 
@@ -50,6 +53,7 @@ class DisasterSurveillanceEnvironment(
     EVENT_MEMORY_LIMIT = 5
     LATENCY_BONUS_THRESHOLD = 3.0
     COORDINATOR_RECENT_MEMORY = 25
+    MAX_SPREAD_EVENTS_PER_STEP = 12
 
     def __init__(
         self,
@@ -102,6 +106,9 @@ class DisasterSurveillanceEnvironment(
                     "id",
                     "location",
                     "severity",
+                    "type",
+                    "type_priority",
+                    "severity_score",
                     "start_time",
                     "duration",
                     "end_time",
@@ -184,6 +191,9 @@ class DisasterSurveillanceEnvironment(
                     "duration": event.duration,
                     "end_time": event.end_time,
                     "severity": event.severity,
+                    "type": event.type,
+                    "type_priority": event_type_priority(event.type),
+                    "severity_score": event.severity_score,
                     "deadline": event.deadline,
                     "deadline_step": event.deadline_step,
                     "detected": event.detected,
@@ -259,6 +269,7 @@ class DisasterSurveillanceEnvironment(
             "total_detection_reward": 0.0,
             "total_miss_penalty": 0.0,
             "total_episode_bonus": 0.0,
+            "total_growth_penalty": 0.0,
             "unique_cells_visited": 0,
             "grid_coverage": 0.0,
             "grid_coverage_percent": 0.0,
@@ -275,6 +286,7 @@ class DisasterSurveillanceEnvironment(
                 "time_penalty": 0.0,
                 "detection_reward": 0.0,
                 "miss_penalty": 0.0,
+                "growth_penalty": 0.0,
                 "overlap_penalty": 0.0,
                 "coverage_reward": 0.0,
                 "episode_bonus": 0.0,
@@ -325,6 +337,7 @@ class DisasterSurveillanceEnvironment(
             for drone_id, drone in self.drones.items():
                 drone.move(actions[drone_id], self.grid_size)
 
+        self._update_events()
         fovs = self._compute_fovs()
         self._remember_observed_cells(fovs)
         detected_events = self._detect_events(fovs)
@@ -392,6 +405,9 @@ class DisasterSurveillanceEnvironment(
                 "id": event.id,
                 "location": event.location,
                 "severity": event.severity,
+                "type": event.type,
+                "type_priority": event_type_priority(event.type),
+                "severity_score": event.severity_score,
                 "time_remaining": event.end_time - self.timestep,
                 "deadline_remaining": event.deadline_step - self.timestep,
             }
@@ -452,21 +468,281 @@ class DisasterSurveillanceEnvironment(
             self._recently_observed_cells = self._recently_observed_cells[-self.COORDINATOR_RECENT_MEMORY :]
 
     def _spawn_step_event(self) -> None:
+        drift = float(np.sin(self.timestep / 10.0))
+        adjusted_p_spawn = float(np.clip(self.p_spawn * (1.0 + 0.5 * drift), 0.0, 1.0))
         new_event = spawn_event(
             self.rng,
             self.timestep,
             self.next_event_id,
             self.grid_size,
-            self.p_spawn,
+            adjusted_p_spawn,
         )
         if new_event is None:
             return
 
-        self.events.append(new_event)
-        self.next_event_id += 1
+        self._register_new_event(new_event)
+
+    def _register_new_event(self, event: Event) -> None:
+        self.events.append(event)
+        self.next_event_id = max(self.next_event_id, event.id + 1)
         self.metrics["total_events_spawned"] += 1
-        self.metrics["events_spawned_by_severity"][new_event.severity] += 1
+        self.metrics["events_spawned_by_severity"][event.severity] += 1
         self._sync_priority_metrics()
+
+    def _valid_cell(self, x: int, y: int) -> bool:
+        return 0 <= x < self.grid_size and 0 <= y < self.grid_size
+
+    def _event_exists_at(self, location: Coord, event_type: str) -> bool:
+        return any(
+            event.location == location and event.type == event_type and not event.detected and event.is_active(self.timestep)
+            for event in self.events
+        )
+
+    def _spawn_dynamic_event(self, *, location: Coord, event_type: str, template: Event) -> Event:
+        if event_type == "road_blockage":
+            blockage_level = float(np.clip(max(template.blockage_level, 0.4) * self.rng.uniform(0.9, 1.15), 0.3, 2.0))
+            severity_score = float(np.clip(max(template.severity_score, 0.5) * self.rng.uniform(0.85, 1.0), 0.4, 2.0))
+            return Event(
+                id=self.next_event_id,
+                location=location,
+                start_time=self.timestep,
+                duration=max(3, int(template.duration)),
+                severity=severity_label_from_score(severity_score),
+                type="road_blockage",
+                severity_score=severity_score,
+                blockage_level=blockage_level,
+            )
+
+        if event_type == "injured_civilian":
+            medical_urgency = float(np.clip(max(template.medical_urgency, 0.8) * self.rng.uniform(0.9, 1.1), 0.7, 2.5))
+            severity_score = float(np.clip(max(template.severity_score, 1.4) * self.rng.uniform(0.9, 1.05), 1.2, 3.2))
+            return Event(
+                id=self.next_event_id,
+                location=location,
+                start_time=self.timestep,
+                duration=max(3, int(template.duration)),
+                severity=severity_label_from_score(severity_score),
+                type="injured_civilian",
+                severity_score=severity_score,
+                medical_urgency=medical_urgency,
+            )
+
+        if event_type == "flood_zone":
+            water_level = float(np.clip(max(template.water_level, 1.2) * self.rng.uniform(0.95, 1.1), 1.0, 4.0))
+            spread_pressure = float(np.clip(max(template.spread_pressure, 0.6) * self.rng.uniform(0.9, 1.15), 0.5, 2.0))
+            severity_score = float(np.clip(water_level, 1.0, 4.0))
+            return Event(
+                id=self.next_event_id,
+                location=location,
+                start_time=self.timestep,
+                duration=max(4, int(template.duration)),
+                severity=severity_label_from_score(severity_score),
+                type="flood_zone",
+                severity_score=severity_score,
+                water_level=water_level,
+                spread_pressure=spread_pressure,
+            )
+
+        if event_type == "riot":
+            crowd_pressure = float(np.clip(template.crowd_pressure * self.rng.uniform(0.8, 1.2), 0.3, 2.0))
+            severity_score = float(np.clip(template.severity_score * self.rng.uniform(0.88, 1.04), 1.6, 4.5))
+            return Event(
+                id=self.next_event_id,
+                location=location,
+                start_time=self.timestep,
+                duration=max(4, int(template.duration)),
+                severity=severity_label_from_score(severity_score),
+                type="riot",
+                severity_score=severity_score,
+                crowd_pressure=crowd_pressure,
+            )
+
+        if event_type == "fire":
+            fuel = float(np.clip(max(template.fuel, 0.8) * self.rng.uniform(0.8, 1.1), 0.5, 3.0))
+            intensity = float(np.clip(max(template.intensity, 0.5) * self.rng.uniform(0.75, 0.98), 0.4, 4.5))
+            severity_score = float(intensity)
+            return Event(
+                id=self.next_event_id,
+                location=location,
+                start_time=self.timestep,
+                duration=max(3, int(template.duration)),
+                severity=severity_label_from_score(severity_score),
+                type="fire",
+                severity_score=severity_score,
+                fuel=fuel,
+                intensity=intensity,
+            )
+
+        if event_type == "structural_collapse":
+            structural_instability = float(
+                np.clip(max(template.structural_instability, 0.6) * self.rng.uniform(0.85, 1.15), 0.4, 2.4)
+            )
+            debris_risk = float(np.clip(max(template.debris_risk, 0.5) * self.rng.uniform(0.8, 1.2), 0.3, 2.0))
+            severity_score = float(np.clip(template.severity_score * self.rng.uniform(0.75, 0.95), 1.5, 4.5))
+            return Event(
+                id=self.next_event_id,
+                location=location,
+                start_time=self.timestep,
+                duration=max(4, int(template.duration)),
+                severity=severity_label_from_score(severity_score),
+                type="structural_collapse",
+                severity_score=severity_score,
+                structural_instability=structural_instability,
+                debris_risk=debris_risk,
+            )
+
+        gas_pressure = float(np.clip(max(template.gas_pressure, 1.2) * self.rng.uniform(0.9, 1.2), 0.8, 3.0))
+        toxicity = float(np.clip(max(template.toxicity, 1.0) * self.rng.uniform(0.9, 1.15), 0.7, 2.8))
+        severity_score = float(
+            np.clip(max(template.severity_score, 2.4) * self.rng.uniform(0.85, 1.05), 2.0, 4.5)
+        )
+        return Event(
+            id=self.next_event_id,
+            location=location,
+            start_time=self.timestep,
+            duration=max(4, int(template.duration)),
+            severity=severity_label_from_score(severity_score),
+            type="gas_leak",
+            severity_score=severity_score,
+            gas_pressure=gas_pressure,
+            toxicity=toxicity,
+        )
+
+    def _queue_spread_event(self, *, location: Coord, event_type: str, template: Event, new_events: list[Event]) -> None:
+        if len(new_events) >= self.MAX_SPREAD_EVENTS_PER_STEP:
+            return
+        if self._event_exists_at(location, event_type):
+            return
+        if any(event.location == location and event.type == event_type for event in new_events):
+            return
+        new_events.append(self._spawn_dynamic_event(location=location, event_type=event_type, template=template))
+
+    def _update_events(self) -> None:
+        new_events: list[Event] = []
+        for event in list(self.events):
+            if not event.is_active(self.timestep) or event.detected:
+                continue
+            if event.type == "riot":
+                self._update_riot(event, new_events)
+            elif event.type == "road_blockage":
+                self._update_road_blockage(event)
+            elif event.type == "injured_civilian":
+                self._update_injured_civilian(event)
+            elif event.type == "flood_zone":
+                self._update_flood_zone(event, new_events)
+            elif event.type == "fire":
+                self._update_fire(event, new_events)
+            elif event.type == "structural_collapse":
+                self._update_structural_collapse(event, new_events)
+            elif event.type == "gas_leak":
+                self._update_gas_leak(event, new_events)
+        for event in new_events:
+            self._register_new_event(event)
+
+    def _update_road_blockage(self, event: Event) -> None:
+        event.blockage_level *= 1.01
+        event.severity_score = float(min(1.6, event.severity_score + 0.03 * max(event.blockage_level, 0.5)))
+        event.severity = severity_label_from_score(event.severity_score)
+        if not event.detected:
+            event.end_time = event.end_time + 1
+
+    def _update_injured_civilian(self, event: Event) -> None:
+        event.medical_urgency += 0.08
+        event.severity_score = float(min(3.2, event.severity_score + 0.12 * max(event.medical_urgency, 0.8)))
+        event.severity = severity_label_from_score(event.severity_score)
+        if not event.detected:
+            event.end_time = event.end_time + 1
+
+    def _update_flood_zone(self, event: Event, new_events: list[Event]) -> None:
+        event.water_level += 0.12 * max(event.spread_pressure, 0.5)
+        event.spread_pressure *= 1.02
+        event.severity_score = float(min(4.0, event.water_level))
+        event.severity = severity_label_from_score(event.severity_score)
+        if not event.detected:
+            event.end_time = event.end_time + 1
+
+        x, y = event.location
+        spread_probability = min(0.12, 0.04 * float(event.spread_pressure))
+        for dx, dy in ((1, 0), (-1, 0), (0, 1), (0, -1)):
+            nx, ny = x + dx, y + dy
+            if not self._valid_cell(nx, ny):
+                continue
+            if self.rng.random() < spread_probability:
+                self._queue_spread_event(location=(nx, ny), event_type="flood_zone", template=event, new_events=new_events)
+
+    def _update_riot(self, event: Event, new_events: list[Event]) -> None:
+        event.severity_score += 0.14 * float(event.crowd_pressure)
+        event.crowd_pressure *= 1.015
+        event.severity = severity_label_from_score(event.severity_score)
+        if not event.detected:
+            event.end_time = event.end_time + 1
+
+        x, y = event.location
+        spread_probability = 0.03 if event.severity == "MEDIUM" else 0.07 if event.severity == "HIGH" else 0.0
+        for dx, dy in ((1, 0), (-1, 0), (0, 1), (0, -1)):
+            nx, ny = x + dx, y + dy
+            if not self._valid_cell(nx, ny):
+                continue
+            if self.rng.random() < spread_probability:
+                self._queue_spread_event(location=(nx, ny), event_type="riot", template=event, new_events=new_events)
+
+    def _update_fire(self, event: Event, new_events: list[Event]) -> None:
+        event.intensity += 0.4 * float(event.fuel)
+        event.fuel *= 0.97
+        event.severity_score = float(event.intensity)
+        event.severity = severity_label_from_score(event.severity_score)
+
+        x, y = event.location
+        spread_probability = min(0.35, 0.13 * float(event.intensity))
+        for dx, dy in ((1, 0), (-1, 0), (0, 1), (0, -1)):
+            nx, ny = x + dx, y + dy
+            if not self._valid_cell(nx, ny):
+                continue
+            if self.rng.random() < spread_probability:
+                self._queue_spread_event(location=(nx, ny), event_type="fire", template=event, new_events=new_events)
+
+    def _update_structural_collapse(self, event: Event, new_events: list[Event]) -> None:
+        event.structural_instability += 0.04 * max(event.debris_risk, 0.5)
+        event.debris_risk *= 1.01
+        event.severity_score = float(min(2.4, event.severity_score + 0.06 * event.structural_instability))
+        event.severity = severity_label_from_score(event.severity_score)
+        if not event.detected:
+            event.end_time = event.end_time + 1
+
+        if event.severity != "HIGH":
+            return
+
+        x, y = event.location
+        for dx, dy in ((1, 0), (-1, 0), (0, 1), (0, -1)):
+            nx, ny = x + dx, y + dy
+            if not self._valid_cell(nx, ny):
+                continue
+            if self.rng.random() < 0.02:
+                self._queue_spread_event(
+                    location=(nx, ny),
+                    event_type="structural_collapse",
+                    template=event,
+                    new_events=new_events,
+                )
+
+    def _update_gas_leak(self, event: Event, new_events: list[Event]) -> None:
+        event.gas_pressure += 0.16
+        event.toxicity *= 1.05
+        event.severity_score = float(min(4.5, event.gas_pressure + 0.9 * event.toxicity))
+        event.severity = severity_label_from_score(event.severity_score)
+        if not event.detected:
+            event.end_time = event.end_time + 1
+
+        x, y = event.location
+        gas_spread_probability = min(0.2, 0.065 * float(event.gas_pressure + event.toxicity))
+        for dx, dy in ((1, 0), (-1, 0), (0, 1), (0, -1)):
+            nx, ny = x + dx, y + dy
+            if not self._valid_cell(nx, ny):
+                continue
+            if self.rng.random() < gas_spread_probability:
+                self._queue_spread_event(location=(nx, ny), event_type="gas_leak", template=event, new_events=new_events)
+            if event.severity == "HIGH" and self.rng.random() < 0.04:
+                self._queue_spread_event(location=(nx, ny), event_type="fire", template=event, new_events=new_events)
 
     def _resolve_coordinator_targets(
         self,
@@ -575,6 +851,7 @@ class DisasterSurveillanceEnvironment(
             fovs=fovs,
             visited_cells=self.visited_cells,
             reward_per_new_cell=self.coverage_reward_per_new_cell,
+            active_undetected_events=[event for event in self.events if event.is_active(self.timestep) and not event.detected],
         )
 
     def _apply_reward_metrics(self, reward_info: Mapping[str, Any]) -> None:
@@ -583,9 +860,11 @@ class DisasterSurveillanceEnvironment(
         self.metrics["total_coverage_reward"] += reward_info["coverage_reward"]
         self.metrics["total_detection_reward"] += reward_info["detection_reward"]
         self.metrics["total_miss_penalty"] += reward_info["miss_penalty"]
+        self.metrics["total_growth_penalty"] += reward_info.get("growth_penalty", 0.0)
         for key, value in reward_info["reward_breakdown"].items():
             if key == "episode_bonus":
                 continue
+            self.metrics["reward_breakdown"].setdefault(key, 0.0)
             self.metrics["reward_breakdown"][key] += float(value)
         self._sync_coverage_metrics()
         self._sync_priority_metrics()

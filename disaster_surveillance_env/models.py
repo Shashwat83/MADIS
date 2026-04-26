@@ -28,6 +28,24 @@ HOTSPOTS: Tuple[Dict[str, Any], ...] = (
     {"center": (2, 2), "radius": 2, "weight": 0.4},
     {"center": (7, 7), "radius": 2, "weight": 0.4},
 )
+EVENT_TYPES: Tuple[str, ...] = (
+    "road_blockage",
+    "structural_collapse",
+    "injured_civilian",
+    "flood_zone",
+    "riot",
+    "fire",
+    "gas_leak",
+)
+EVENT_TYPE_PRIORITY: Dict[str, int] = {
+    "road_blockage": 1,
+    "structural_collapse": 2,
+    "injured_civilian": 3,
+    "flood_zone": 4,
+    "fire": 5,
+    "riot": 6,
+    "gas_leak": 7,
+}
 
 
 @dataclass
@@ -37,12 +55,32 @@ class Event:
     start_time: int
     duration: int
     severity: str
+    type: str = "road_blockage"
+    severity_score: float = 1.0
+    crowd_pressure: float = 0.0
+    fuel: float = 0.0
+    intensity: float = 0.0
+    structural_instability: float = 0.0
+    debris_risk: float = 0.0
+    gas_pressure: float = 0.0
+    toxicity: float = 0.0
+    blockage_level: float = 0.0
+    medical_urgency: float = 0.0
+    water_level: float = 0.0
+    spread_pressure: float = 0.0
+    contamination: float = 0.0
+    volatility: float = 0.0
     detected: bool = False
     detection_time: Optional[int] = None
+    _end_time_override: Optional[int] = None
 
     @property
     def end_time(self) -> int:
-        return self.start_time + self.duration
+        return self._end_time_override if self._end_time_override is not None else self.start_time + self.duration
+
+    @end_time.setter
+    def end_time(self, value: int) -> None:
+        self._end_time_override = int(value)
 
     @property
     def deadline(self) -> int:
@@ -58,6 +96,18 @@ class Event:
 
     def is_active(self, timestep: int) -> bool:
         return self.start_time <= timestep < self.end_time
+
+
+def severity_label_from_score(severity_score: float) -> str:
+    if severity_score >= 3.0:
+        return "HIGH"
+    if severity_score >= 2.0:
+        return "MEDIUM"
+    return "LOW"
+
+
+def event_type_priority(event_type: str) -> int:
+    return EVENT_TYPE_PRIORITY.get(event_type, 1)
 
 
 @dataclass
@@ -210,15 +260,75 @@ def sample_event(
     if rng.random() >= p_spawn:
         return None
 
-    severity = sample_event_severity(rng)
     location = sample_event_location_with_hotspots(rng, grid_size, hotspots)
     duration = int(rng.integers(5, 11))
+    event_type_probabilities = np.array([0.22, 0.12, 0.18, 0.15, 0.12, 0.12, 0.09], dtype=float)
+    event_type_probabilities = event_type_probabilities / event_type_probabilities.sum()
+    event_type = str(rng.choice(EVENT_TYPES, p=event_type_probabilities))
+    severity_score = 1.0
+    crowd_pressure = 0.0
+    fuel = 0.0
+    intensity = 0.0
+    structural_instability = 0.0
+    debris_risk = 0.0
+    gas_pressure = 0.0
+    toxicity = 0.0
+    blockage_level = 0.0
+    medical_urgency = 0.0
+    water_level = 0.0
+    spread_pressure = 0.0
+    contamination = 0.0
+    volatility = 0.0
+
+    if event_type == "road_blockage":
+        blockage_level = float(rng.uniform(0.5, 1.4))
+        severity_score = float(rng.uniform(0.6, 1.1))
+    elif event_type == "structural_collapse":
+        structural_instability = float(rng.uniform(0.6, 1.0))
+        debris_risk = float(rng.uniform(0.8, 1.4))
+        severity_score = float(rng.uniform(1.2, 1.8))
+    elif event_type == "injured_civilian":
+        medical_urgency = float(rng.uniform(1.0, 1.8))
+        severity_score = float(rng.uniform(1.6, 2.2))
+    elif event_type == "flood_zone":
+        water_level = float(rng.uniform(1.6, 2.2))
+        spread_pressure = float(rng.uniform(0.7, 1.3))
+        severity_score = float(water_level)
+    elif event_type == "riot":
+        crowd_pressure = float(rng.uniform(0.9, 1.5))
+        severity_score = float(rng.uniform(2.2, 3.0))
+    elif event_type == "fire":
+        fuel = float(rng.uniform(1.0, 3.0))
+        intensity = float(rng.uniform(1.8, 2.5))
+        severity_score = float(intensity)
+    else:
+        gas_pressure = float(rng.uniform(1.8, 2.6))
+        toxicity = float(rng.uniform(1.4, 2.2))
+        severity_score = float(rng.uniform(2.8, 3.6))
+
+    severity = severity_label_from_score(severity_score)
+
     return Event(
         id=next_event_id,
         location=location,
         start_time=timestep,
         duration=duration,
         severity=severity,
+        type=event_type,
+        severity_score=severity_score,
+        crowd_pressure=crowd_pressure,
+        fuel=fuel,
+        intensity=intensity,
+        structural_instability=structural_instability,
+        debris_risk=debris_risk,
+        gas_pressure=gas_pressure,
+        toxicity=toxicity,
+        blockage_level=blockage_level,
+        medical_urgency=medical_urgency,
+        water_level=water_level,
+        spread_pressure=spread_pressure,
+        contamination=contamination,
+        volatility=volatility,
     )
 
 
@@ -338,6 +448,9 @@ def build_observation(
                 "id": event.id,
                 "location": event.location,
                 "severity": event.severity,
+                "type": event.type,
+                "type_priority": event_type_priority(event.type),
+                "severity_score": event.severity_score,
                 "start_time": event.start_time,
                 "duration": event.duration,
                 "end_time": event.end_time,
@@ -430,6 +543,7 @@ def compute_level5_reward(
     fovs: Mapping[str, set[Coord]],
     visited_cells: set[Coord],
     reward_per_new_cell: float = 0.5,
+    active_undetected_events: Optional[Sequence[Event]] = None,
 ) -> Tuple[float, Dict[str, Any]]:
     overlap_penalty, overlap_info = compute_overlap_penalty(fovs)
     coverage_reward, current_visible_cells, new_cells = compute_coverage_reward(
@@ -446,12 +560,18 @@ def compute_level5_reward(
     miss_penalties = {event.id: compute_miss_penalty(event) for event in missed_events}
     total_detection_reward = float(sum(detection_rewards.values()))
     total_miss_penalty = float(sum(miss_penalties.values()))
+    growth_penalty = 0.1 * sum(
+        float(event.severity_score)
+        for event in (active_undetected_events or [])
+        if not event.detected
+    )
 
-    reward = -1.0 + total_detection_reward + total_miss_penalty + overlap_penalty + coverage_reward
+    reward = -1.0 + total_detection_reward + total_miss_penalty + overlap_penalty + coverage_reward - growth_penalty
     return reward, {
         **overlap_info,
         "detection_reward": total_detection_reward,
         "miss_penalty": total_miss_penalty,
+        "growth_penalty": -growth_penalty,
         "episode_bonus": 0.0,
         "overlap_penalty": overlap_penalty,
         "coverage_reward": coverage_reward,
@@ -464,6 +584,7 @@ def compute_level5_reward(
             "time_penalty": -1.0,
             "detection_reward": total_detection_reward,
             "miss_penalty": total_miss_penalty,
+            "growth_penalty": -growth_penalty,
             "overlap_penalty": overlap_penalty,
             "coverage_reward": coverage_reward,
             "episode_bonus": 0.0,
