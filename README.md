@@ -9,26 +9,29 @@ pinned: false
 
 # MADIS
 #
- Disaster Surveillance OpenEnv
+Disaster Surveillance OpenEnv
+
+## Walkthrough video
+
+Project overview and demo: `https://youtu.be/VK2XK-aKVHU?si=9HLUOIuAXnI1kJ_d`
 
 This repository now follows the standard OpenEnv environment layout instead of keeping
 the implementation in a single file.
 
-## Environment Level
+## Environment levels
 
-Current setup is `Level 6 (Coordinator-Driven Planning)`:
+This repo implements a **multi-agent** drone surveillance environment with multiple “levels” of increasing difficulty/realism:
 
-- 3 independent RL drone agents
-- an inference-only coordinator LLM assigns high-level target coordinates to drones
-- drones execute one step toward their assigned targets each timestep
-- reward still includes event detection, severity-aware miss penalties, timestep, FOV overlap, team coverage, and delayed episode-end bonuses
-- Level 3 baseline mode is also available and keeps only the basic shared reward
-- Level 4 remains available with overlap and coverage shaping
-- Level 5 adds severity, deadlines, hotspot-biased spawning, delayed rewards, and urgency-sensitive prioritization
-- Level 6 adds a centralized coordinator interface and an inference-only small-model LLM coordinator with heuristic fallback
-- team-level FOV coverage is tracked without double counting overlapping visible cells
-- no communication between agents
-- coordination now comes from explicit target assignment, while the reward structure still pushes urgent, high-value event handling
+- **Level 3**: baseline decentralized multi-agent RL interface with a shared global reward.
+- **Level 4**: adds overlap and coverage shaping.
+- **Level 5**: adds urgency/deadlines, severity-aware rewards/penalties, delayed bonuses, hotspot-biased spawning, and a growth penalty for undetected active disasters.
+- **Level 6**: introduces a **central coordinator policy** that assigns target coordinates to 3 drones (LLM coordinator with heuristic fallback).
+- **Level 9**: adversarial setting where a scripted adversary injects **false-positive incident reports** with credibility; the coordinator must prioritize confirmed visible events and avoid wasting steps chasing decoys (false-report penalty is applied when drones are assigned to false reports).
+
+Core mechanics:
+- **3 drones** move on a 10x10 grid with partial observability (FOV).
+- **Dynamic disasters** can escalate/spread (e.g. riot/fire/gas leak/flood zone behaviors).
+- Episode metrics include total reward, high-priority miss rate, on-time detection rate, coverage, and path efficiency.
 
 ## Structure
 
@@ -61,7 +64,19 @@ Run the local random rollout:
 python3 scripts/run_random_episode.py --level 6 --episodes 1
 ```
 
-Level 6 uses the coordinator model `Qwen/Qwen3-1.7B` by default through Hugging Face inference when available. If inference is unavailable locally, the env falls back to the heuristic coordinator and logs that fallback in metrics.
+Try the adversarial variant:
+
+```bash
+python3 scripts/run_random_episode.py --level 9 --episodes 1 --render
+```
+
+Level 6/9 can use a coordinator model (default `Qwen/Qwen3-1.7B`) via Hugging Face router when available. If inference is unavailable locally, the env falls back to the heuristic coordinator and logs that fallback in metrics.
+
+## Training + evaluation utilities
+
+- **SFT**: `scripts/train_sft_coordinator.py`
+- **GRPO**: `scripts/train_grpo_coordinator.py`
+- **Compare base vs SFT vs SFT+GRPO** (fixed seeds, summary + plots): `scripts/compare_coordinator_variants.py`
 
 ## Hugging Face authentication (Colab + local)
 
